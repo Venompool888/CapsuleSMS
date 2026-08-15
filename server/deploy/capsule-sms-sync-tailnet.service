@@ -1,0 +1,11 @@
+[Unit]
+Description=Capsule SMS Sync tailnet socket proxy
+Requires=capsule-sms-sync.service
+After=capsule-sms-sync.service
+
+[Service]
+ExecStart=/lib/systemd/systemd-socket-proxyd 127.0.0.1:8787
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true

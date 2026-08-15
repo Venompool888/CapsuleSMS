@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">胶囊短信</string>
+    <string name="cloud_push_to">推送本设备短信到“%1$s”</string>
+    <string name="cloud_receive_from">接收来自“%1$s”的推送</string>
 </resources>

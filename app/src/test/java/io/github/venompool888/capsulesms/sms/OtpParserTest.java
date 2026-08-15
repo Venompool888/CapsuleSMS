@@ -31,6 +31,15 @@ public final class OtpParserTest {
                 "Your verification code is A7K29Q. Do not share this code.").code());
     }
 
+    @Test public void parsesWeChatNotificationSamples() {
+        assertEquals("470236", OtpParser.parse(
+                "[WeChat] Verification code: 470236. The code is only used for removing restrictions.")
+                .code());
+        assertEquals("660306", OtpParser.parse(
+                "【腾讯科技】你正在登录微信，验证码 660306。转发可能导致账号被盗。")
+                .code());
+    }
+
     @Test public void rejectsAmountWithoutOtpMeaning() {
         OtpParser.Result result = OtpParser.parse("您尾号 1234 的账户支出 88.50 元");
         assertEquals(OtpParser.Result.Status.NONE, result.status());

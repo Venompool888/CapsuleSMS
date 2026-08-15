@@ -17,9 +17,11 @@ import java.util.Set;
 public final class SmsRepository {
     private static final Uri SMS_URI = Telephony.Sms.CONTENT_URI;
     private final ContentResolver resolver;
+    private final CloudMessageOriginStore originStore;
 
     public SmsRepository(Context context) {
         resolver = context.getContentResolver();
+        originStore = new CloudMessageOriginStore(context);
     }
 
     public List<SmsModels.Conversation> conversations() {
@@ -42,12 +44,12 @@ public final class SmsRepository {
                     result.put(address, new SmsModels.Conversation(
                             address, safe(cursor.getString(bodyIndex), ""), cursor.getLong(dateIndex), unread,
                             cursor.getInt(subscriptionIndex), cursor.getLong(idIndex),
-                            cursor.getInt(typeIndex)));
+                            cursor.getInt(typeIndex), originStore.getOrigin(cursor.getLong(idIndex))));
                 } else if (unread != previous.unread()) {
                     result.put(address, new SmsModels.Conversation(
                             previous.address(), previous.preview(), previous.date(), unread,
                             previous.subscriptionId(), previous.latestMessageId(),
-                            previous.latestMessageType()));
+                            previous.latestMessageType(), previous.origin()));
                 }
             }
         }
@@ -62,13 +64,41 @@ public final class SmsRepository {
                 "date DESC LIMIT " + Math.max(1, limit))) {
             if (cursor == null) return result;
             while (cursor.moveToNext()) {
+                long id = cursor.getLong(0);
                 result.add(new SmsModels.Message(
-                        cursor.getLong(0), safe(cursor.getString(1), address),
-                        safe(cursor.getString(2), ""), cursor.getLong(3), cursor.getInt(4)));
+                        id, safe(cursor.getString(1), address),
+                        safe(cursor.getString(2), ""), cursor.getLong(3), cursor.getInt(4),
+                        originStore.getOrigin(id)));
             }
         }
         Collections.reverse(result);
         return result;
+    }
+
+    public CloudMessageOriginStore.Origin latestCloudOrigin(String address) {
+        try (Cursor cursor = resolver.query(
+                SMS_URI, new String[]{"_id", "type"}, "address = ?", new String[]{address},
+                "date DESC LIMIT 100")) {
+            if (cursor == null) return null;
+            while (cursor.moveToNext()) {
+                if (cursor.getInt(1) != Telephony.Sms.MESSAGE_TYPE_INBOX) continue;
+                CloudMessageOriginStore.Origin origin = originStore.getOrigin(cursor.getLong(0));
+                // A local incoming SMS is authoritative: reply locally. Legacy cloud rows only
+                // had a device name, so keep looking for the newest row with a complete route.
+                if (origin == null) return null;
+                if (origin.deviceId != null && origin.subscriptionId >= 0) return origin;
+            }
+        }
+        return null;
+    }
+
+    public int latestSubscriptionId(String address) {
+        try (Cursor cursor = resolver.query(
+                SMS_URI, new String[]{"sub_id"}, "address = ?", new String[]{address},
+                "date DESC LIMIT 1")) {
+            return cursor != null && cursor.moveToFirst()
+                    ? cursor.getInt(0) : android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+        }
     }
 
     public void markRead(String address) {
@@ -131,7 +161,9 @@ public final class SmsRepository {
         values.put("read", 0);
         values.put("seen", 0);
         if (subscriptionId >= 0) values.put("sub_id", subscriptionId);
-        return context.getContentResolver().insert(Telephony.Sms.Inbox.CONTENT_URI, values);
+        Uri saved = context.getContentResolver().insert(Telephony.Sms.Inbox.CONTENT_URI, values);
+        if (saved != null) context.getContentResolver().notifyChange(SMS_URI, null);
+        return saved;
     }
 
     public static Uri saveSent(
@@ -140,7 +172,39 @@ public final class SmsRepository {
         values.put("read", 1);
         values.put("seen", 1);
         if (subscriptionId >= 0) values.put("sub_id", subscriptionId);
-        return context.getContentResolver().insert(Telephony.Sms.Sent.CONTENT_URI, values);
+        Uri saved = context.getContentResolver().insert(Telephony.Sms.Sent.CONTENT_URI, values);
+        if (saved != null) context.getContentResolver().notifyChange(SMS_URI, null);
+        return saved;
+    }
+
+    public static boolean containsMessage(
+            Context context, String address, String body, long timestamp, int type) {
+        long tolerance = 2_000L;
+        String selection = "address = ? AND body = ? AND type = ? AND date BETWEEN ? AND ?";
+        String[] args = {
+                address, body, Integer.toString(type),
+                Long.toString(Math.max(0L, timestamp - tolerance)),
+                Long.toString(timestamp + tolerance)
+        };
+        try (Cursor cursor = context.getContentResolver().query(
+                SMS_URI, new String[]{"_id"}, selection, args, "date DESC LIMIT 1")) {
+            return cursor != null && cursor.moveToFirst();
+        }
+    }
+
+    public static long findMessageId(
+            Context context, String address, String body, long timestamp, int type) {
+        long tolerance = 2_000L;
+        String selection = "address = ? AND body = ? AND type = ? AND date BETWEEN ? AND ?";
+        String[] args = {
+                address, body, Integer.toString(type),
+                Long.toString(Math.max(0L, timestamp - tolerance)),
+                Long.toString(timestamp + tolerance)
+        };
+        try (Cursor cursor = context.getContentResolver().query(
+                SMS_URI, new String[]{"_id"}, selection, args, "date DESC LIMIT 1")) {
+            return cursor != null && cursor.moveToFirst() ? cursor.getLong(0) : -1L;
+        }
     }
 
     private static ContentValues baseValues(String address, String body, long timestamp) {

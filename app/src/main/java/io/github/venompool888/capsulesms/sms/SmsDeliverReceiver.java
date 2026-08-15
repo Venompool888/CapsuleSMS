@@ -13,6 +13,7 @@ import android.telephony.SubscriptionManager;
 
 import io.github.venompool888.capsulesms.MainActivity;
 import io.github.venompool888.capsulesms.R;
+import io.github.venompool888.capsulesms.sync.CloudSyncEngine;
 
 public final class SmsDeliverReceiver extends BroadcastReceiver {
     @Override public void onReceive(Context context, Intent intent) {
@@ -29,9 +30,32 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
                 SubscriptionManager.INVALID_SUBSCRIPTION_ID);
         SmsRepository.saveIncoming(context, address, body.toString(), timestamp, subscriptionId);
         notifyIncoming(context, address, body.toString());
+        CloudSyncEngine.uploadAsync(
+                context, address, body.toString(), timestamp, subscriptionId,
+                Telephony.Sms.MESSAGE_TYPE_INBOX);
     }
 
-    private void notifyIncoming(Context context, String address, String body) {
+    static void simulateIncoming(Context context, String address, String body) {
+        simulateIncoming(context, address, body, SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+    }
+
+    static void simulateIncoming(
+            Context context, String address, String body, int subscriptionId) {
+        long timestamp = System.currentTimeMillis();
+        SmsRepository.saveIncoming(context, address, body, timestamp,
+                subscriptionId);
+        notifyIncoming(context, address, body);
+        CloudSyncEngine.uploadAsync(
+                context, address, body, timestamp, subscriptionId,
+                Telephony.Sms.MESSAGE_TYPE_INBOX);
+    }
+
+    public static void notifyIncoming(Context context, String address, String body) {
+        notifyIncoming(context, address, body, null);
+    }
+
+    public static void notifyIncoming(
+            Context context, String address, String body, String receivingLine) {
         String channelId = "incoming_sms";
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel(
@@ -42,14 +66,27 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
         PendingIntent content = PendingIntent.getActivity(
                 context, address.hashCode(), open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        android.app.Notification notification = new android.app.Notification.Builder(context, channelId)
+        android.app.Notification.Builder notification = new android.app.Notification.Builder(context, channelId)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(address)
+                .setContentTitle(receivingLine == null ? address : address + " · " + receivingLine)
                 .setContentText(body)
                 .setStyle(new android.app.Notification.BigTextStyle().bigText(body))
                 .setContentIntent(content)
-                .setAutoCancel(true)
-                .build();
-        manager.notify(address.hashCode(), notification);
+                .setAutoCancel(true);
+
+        OtpParser.Result otp = OtpParser.parse(body);
+        if (otp.status() == OtpParser.Result.Status.SUCCESS) {
+            Intent copy = new Intent(context, CopyOtpReceiver.class)
+                    .setAction(CopyOtpReceiver.ACTION_COPY_OTP)
+                    .putExtra(CopyOtpReceiver.EXTRA_OTP, otp.code());
+            int requestCode = (address + "\u0000" + otp.code()).hashCode();
+            PendingIntent copyAction = PendingIntent.getBroadcast(
+                    context, requestCode, copy,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            notification.addAction(new android.app.Notification.Action.Builder(
+                    R.drawable.ic_copy_code, otp.code(), copyAction).build());
+        }
+
+        manager.notify(address.hashCode(), notification.build());
     }
 }
