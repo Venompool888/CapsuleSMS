@@ -23,6 +23,7 @@ import java.util.function.IntFunction;
 
 public final class TypographySettingsActivity extends Activity {
     private UiPalette palette;
+    private LayoutProfile layoutProfile;
     private TypographyPreferences typography;
     private ScrollView settingsScroll;
     private LinearLayout pageContent;
@@ -32,6 +33,7 @@ public final class TypographySettingsActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         palette = UiPalette.from(this);
+        layoutProfile = LayoutProfile.from(this);
         palette.applySystemBars(this);
         typography = new TypographyPreferences(this);
 
@@ -108,11 +110,12 @@ public final class TypographySettingsActivity extends Activity {
         pageContent.addView(preview, previewParams());
 
         Runnable render = () -> {
-            int verticalPadding = typography.inboxItemVerticalPaddingDp();
+            int verticalPadding = layoutProfile.inboxVerticalPaddingDp(
+                    typography.inboxItemVerticalPaddingDp());
             for (InboxPreviewRow value : rows) {
-                setInboxTextSize(value.title, 16);
-                setInboxTextSize(value.preview, 13);
-                setInboxTextSize(value.time, 11);
+                setInboxTextSize(value.title, 18);
+                setInboxTextSize(value.preview, 15);
+                setInboxTextSize(value.time, 13);
                 value.preview.setLineSpacing(0, typography.inboxLineSpacingMultiplier());
                 value.root.setPadding(dp(2), dp(verticalPadding), dp(2), dp(verticalPadding));
             }
@@ -190,28 +193,32 @@ public final class TypographySettingsActivity extends Activity {
     private InboxPreviewRow inboxPreviewRow(String titleValue, String previewValue, String timeValue) {
         LinearLayout root = row();
         root.setGravity(Gravity.TOP);
-        TextView avatar = text(titleValue.substring(0, 1), 18, Color.WHITE);
+        TextView avatar = text(titleValue.substring(0, 1),
+                layoutProfile.avatarTextSp, Color.WHITE);
         avatar.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         avatar.setGravity(Gravity.CENTER);
-        avatar.setBackground(rounded(palette.avatar(titleValue.hashCode()), 22));
-        root.addView(avatar, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        avatar.setBackground(rounded(palette.avatar(titleValue.hashCode()),
+                layoutProfile.avatarSizeDp / 2));
+        root.addView(avatar, new LinearLayout.LayoutParams(
+                dp(layoutProfile.avatarSizeDp), dp(layoutProfile.avatarSizeDp)));
 
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
-        copy.setPadding(dp(12), 0, dp(7), 0);
-        TextView title = text(titleValue, 16, palette.textPrimary);
+        copy.setPadding(dp(layoutProfile.copyStartPaddingDp), 0,
+                dp(layoutProfile.copyEndPaddingDp), 0);
+        TextView title = text(titleValue, 18, palette.textPrimary);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setSingleLine(true);
-        TextView message = text(previewValue, 13, palette.textMuted);
+        TextView message = text(previewValue, 15, palette.textMuted);
         message.setMaxLines(2);
         message.setEllipsize(android.text.TextUtils.TruncateAt.END);
         copy.addView(title);
         copy.addView(message);
         root.addView(copy, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        TextView time = text(timeValue, 11, palette.textMuted);
+        TextView time = text(timeValue, 13, palette.textMuted);
         time.setGravity(Gravity.END);
-        root.addView(time, new LinearLayout.LayoutParams(dp(48),
+        root.addView(time, new LinearLayout.LayoutParams(dp(layoutProfile.metaWidthDp),
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         return new InboxPreviewRow(root, title, message, time);
     }

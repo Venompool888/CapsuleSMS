@@ -102,6 +102,7 @@ public final class MainActivity extends Activity {
     private static final String SNAPSHOT_KEY = "conversations";
     private final ExecutorService io = Executors.newFixedThreadPool(2);
     private UiPalette palette;
+    private LayoutProfile layoutProfile;
     private TypographyPreferences typography;
     private String appliedTypographySignature;
     private LinearLayout root;
@@ -149,6 +150,7 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         palette = UiPalette.from(this);
+        layoutProfile = LayoutProfile.from(this);
         typography = new TypographyPreferences(this);
         appliedTypographySignature = typography.signature();
         palette.applySystemBars(this);
@@ -169,7 +171,7 @@ public final class MainActivity extends Activity {
     }
 
     private void applySystemBarInsets() {
-        int horizontalPadding = dp(16);
+        int horizontalPadding = dp(layoutProfile.contentHorizontalPaddingDp);
         int verticalPadding = dp(8);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             android.graphics.Insets systemBars = insets.getInsets(
@@ -388,7 +390,8 @@ public final class MainActivity extends Activity {
             }
             @Override public void afterTextChanged(Editable value) {}
         });
-        LinearLayout.LayoutParams searchParams = new LinearLayout.LayoutParams(0, dp(46), 1);
+        LinearLayout.LayoutParams searchParams = new LinearLayout.LayoutParams(
+                0, dp(layoutProfile.searchHeightDp), 1);
         header.addView(search, searchParams);
         root.addView(header);
 
@@ -659,12 +662,14 @@ public final class MainActivity extends Activity {
     private View createConversationRow(SmsModels.Conversation conversation) {
         LinearLayout item = row();
         item.setGravity(Gravity.TOP);
-        int itemPadding = typography.inboxItemVerticalPaddingDp();
-        item.setMinimumHeight(dp(54 + itemPadding * 2));
+        int itemPadding = layoutProfile.inboxVerticalPaddingDp(
+                typography.inboxItemVerticalPaddingDp());
+        item.setMinimumHeight(dp(layoutProfile.avatarSizeDp + 2 + itemPadding * 2));
         item.setPadding(dp(2), dp(itemPadding), dp(2), dp(itemPadding));
 
         FrameLayout avatar = new FrameLayout(this);
-        avatar.setBackground(rounded(avatarColor(conversation.address()), 28));
+        avatar.setBackground(rounded(avatarColor(conversation.address()),
+                layoutProfile.avatarSizeDp / 2));
         ContactIdentity identity = contactIdentities.get(conversation.address());
         if (identity != null && identity.photo != null) {
             ImageView photo = new ImageView(this);
@@ -673,20 +678,25 @@ public final class MainActivity extends Activity {
             photo.setClipToOutline(true);
             photo.setBackground(rounded(Color.TRANSPARENT, 28));
             photo.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
-            avatar.addView(photo, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER));
+            avatar.addView(photo, new FrameLayout.LayoutParams(
+                    dp(layoutProfile.avatarSizeDp), dp(layoutProfile.avatarSizeDp), Gravity.CENTER));
         } else {
-            TextView mark = text(initial(displayName(conversation.address())), 22, Color.WHITE);
+            TextView mark = text(initial(displayName(conversation.address())),
+                    layoutProfile.avatarTextSp, Color.WHITE);
             mark.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             mark.setGravity(Gravity.CENTER);
-            avatar.addView(mark, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER));
+            avatar.addView(mark, new FrameLayout.LayoutParams(
+                    dp(layoutProfile.avatarSizeDp), dp(layoutProfile.avatarSizeDp), Gravity.CENTER));
         }
-        LinearLayout.LayoutParams avatarParams = new LinearLayout.LayoutParams(dp(52), dp(52));
+        LinearLayout.LayoutParams avatarParams = new LinearLayout.LayoutParams(
+                dp(layoutProfile.avatarSizeDp), dp(layoutProfile.avatarSizeDp));
         avatarParams.setMargins(0, dp(1), 0, 0);
         item.addView(avatar, avatarParams);
 
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
-        copy.setPadding(dp(14), 0, dp(8), 0);
+        copy.setPadding(dp(layoutProfile.copyStartPaddingDp), 0,
+                dp(layoutProfile.copyEndPaddingDp), 0);
         TextView address = inboxText(
                 displayName(conversation.address()), 18, palette.textPrimary);
         address.setSingleLine(true);
@@ -726,7 +736,8 @@ public final class MainActivity extends Activity {
                     ? palette.verificationText : palette.violetText);
             sim.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             sim.setGravity(Gravity.CENTER);
-            sim.setPadding(dp(6), dp(2), dp(6), dp(2));
+            sim.setPadding(dp(layoutProfile.simHorizontalPaddingDp), dp(2),
+                    dp(layoutProfile.simHorizontalPaddingDp), dp(2));
             sim.setBackground(rounded(slot == 1
                     ? palette.verificationSurface : palette.violetSurface, 6));
             status.addView(sim, new LinearLayout.LayoutParams(
@@ -734,8 +745,10 @@ public final class MainActivity extends Activity {
         }
         if (conversation.unread() > 0) {
             View dot = new View(this);
-            dot.setBackground(rounded(avatarColor(conversation.address()), 7));
-            LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(dp(13), dp(13));
+            dot.setBackground(rounded(avatarColor(conversation.address()),
+                    layoutProfile.unreadDotSizeDp / 2 + 1));
+            LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(
+                    dp(layoutProfile.unreadDotSizeDp), dp(layoutProfile.unreadDotSizeDp));
             dotParams.setMargins(dp(5), 0, 0, 0);
             status.addView(dot, dotParams);
         }
@@ -745,7 +758,8 @@ public final class MainActivity extends Activity {
             statusParams.setMargins(0, dp(7), 0, 0);
             meta.addView(status, statusParams);
         }
-        item.addView(meta, new LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT));
+        item.addView(meta, new LinearLayout.LayoutParams(
+                dp(layoutProfile.metaWidthDp), ViewGroup.LayoutParams.WRAP_CONTENT));
         return item;
     }
 
