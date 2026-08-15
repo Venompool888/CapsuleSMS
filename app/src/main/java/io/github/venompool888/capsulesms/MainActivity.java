@@ -36,6 +36,8 @@ import android.text.style.ClickableSpan;
 import android.text.style.ReplacementSpan;
 import android.text.format.DateUtils;
 import android.text.format.DateFormat;
+import android.util.Patterns;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -47,6 +49,7 @@ import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
 import android.widget.BaseAdapter;
+import android.widget.AbsListView;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
@@ -62,9 +65,13 @@ import android.widget.Toast;
 import io.github.venompool888.capsulesms.sms.SmsModels;
 import io.github.venompool888.capsulesms.sms.SmsRepository;
 import io.github.venompool888.capsulesms.sms.SmsSender;
+import io.github.venompool888.capsulesms.sms.CloudMessageOriginStore;
 import io.github.venompool888.capsulesms.sms.TrashCleanupScheduler;
 import io.github.venompool888.capsulesms.sms.TrashStore;
 import io.github.venompool888.capsulesms.sms.VerificationAnnotationStore;
+import io.github.venompool888.capsulesms.sync.AdvancedSettingsActivity;
+import io.github.venompool888.capsulesms.sync.CloudSyncScheduler;
+import io.github.venompool888.capsulesms.sync.CloudSyncEngine;
 
 import java.util.List;
 import java.util.ArrayList;
@@ -73,6 +80,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.io.InputStream;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -84,11 +92,18 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_ROLE = 100;
     private static final int REQUEST_PERMISSIONS = 101;
     private static final int REQUEST_CONTACT = 102;
+    private static final int EDGE_SCROLLBAR_GUTTER_DP = 16;
+    private static final int CONVERSATION_SCROLLBAR_GUTTER_DP = 4;
+    private static final int MESSAGE_EDGE_MARGIN_DP = 8;
+    private static final float MESSAGE_MAX_WIDTH_FRACTION = 0.82f;
     private static final String ACTION_MANUAL_VERIFICATION =
             "io.github.venompool888.capsulesms.MANUAL_VERIFICATION";
     private static final String SNAPSHOT_PREFS = "inbox_snapshot";
     private static final String SNAPSHOT_KEY = "conversations";
     private final ExecutorService io = Executors.newFixedThreadPool(2);
+    private UiPalette palette;
+    private TypographyPreferences typography;
+    private String appliedTypographySignature;
     private LinearLayout root;
     private String currentAddress;
     private List<SmsModels.Conversation> inboxConversations;
@@ -96,6 +111,8 @@ public final class MainActivity extends Activity {
     private final Map<Integer, Integer> subscriptionSlots = new HashMap<>();
     private final List<SimChoice> simChoices = new ArrayList<>();
     private int selectedSubscriptionId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    private CloudMessageOriginStore.Origin currentRemoteOrigin;
+    private EditText activeComposerBody;
     private EditText composerAddressInput;
     private FrameLayout inboxFrame;
     private ListView inboxList;
@@ -104,6 +121,8 @@ public final class MainActivity extends Activity {
     private View inboxLoading;
     private int inboxGeneration;
     private boolean screenInitialized;
+    private boolean defaultSmsStateKnown;
+    private boolean lastDefaultSmsState;
     private boolean showingTrash;
     private boolean smsObserverRegistered;
     private int providerRefreshGeneration;
@@ -112,8 +131,14 @@ public final class MainActivity extends Activity {
     private final Set<Long> selectedMessageIds = new LinkedHashSet<>();
     private final Map<Long, View> messageRows = new HashMap<>();
     private TextView conversationTitle;
+    private TextView conversationSelect;
     private ImageButton conversationDelete;
+    private LinearLayout conversationMessages;
+    private ScrollView conversationScroll;
+    private boolean messageSelectionMode;
     private VerificationAnnotationStore verificationAnnotations;
+    private int hiddenSettingsTapCount;
+    private long hiddenSettingsLastTapAt;
     private final OnBackInvokedCallback backCallback = this::handleBack;
     private final ContentObserver smsObserver = new ContentObserver(new Handler(Looper.getMainLooper())) {
         @Override public void onChange(boolean selfChange, Uri uri) {
@@ -123,9 +148,14 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        palette = UiPalette.from(this);
+        typography = new TypographyPreferences(this);
+        appliedTypographySignature = typography.signature();
+        palette.applySystemBars(this);
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.rgb(251, 252, 255));
+        root.setClipToPadding(false);
+        root.setBackgroundColor(palette.background);
         applySystemBarInsets();
         setContentView(root);
         getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
@@ -134,6 +164,7 @@ public final class MainActivity extends Activity {
         handleLaunchIntent(getIntent());
         new TrashStore(this).purgeExpired();
         TrashCleanupScheduler.schedule(this);
+        CloudSyncScheduler.schedulePeriodic(this);
         ensureSmsRole();
     }
 
@@ -143,11 +174,33 @@ public final class MainActivity extends Activity {
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             android.graphics.Insets systemBars = insets.getInsets(
                     WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+            android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+            boolean keyboardVisible = insets.isVisible(WindowInsets.Type.ime());
+            int bottomInset = keyboardVisible
+                    ? Math.max(systemBars.bottom, ime.bottom) : systemBars.bottom;
             view.setPadding(
                     horizontalPadding + systemBars.left,
                     verticalPadding + systemBars.top,
                     horizontalPadding + systemBars.right,
-                    verticalPadding + systemBars.bottom);
+                    verticalPadding + bottomInset);
+            if (keyboardVisible) {
+                if (activeComposerBody != null && activeComposerBody.hasFocus()) {
+                    view.post(this::scrollConversationToBottom);
+                } else {
+                    view.postDelayed(() -> {
+                    WindowInsets current = view.getRootWindowInsets();
+                    if (current == null || !current.isVisible(WindowInsets.Type.ime())) return;
+                    if (activeComposerBody == null || !activeComposerBody.isAttachedToWindow()
+                            || !activeComposerBody.hasFocus()) {
+                        android.view.WindowInsetsController controller =
+                                view.getWindowInsetsController();
+                        if (controller != null) controller.hide(WindowInsets.Type.ime());
+                        return;
+                    }
+                    scrollConversationToBottom();
+                    }, 220L);
+                }
+            }
             return insets;
         });
         root.setPadding(horizontalPadding, verticalPadding, horizontalPadding, verticalPadding);
@@ -158,6 +211,11 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         handleLaunchIntent(intent);
+        if (screenInitialized && currentAddress != null && !currentAddress.isBlank()
+                && !ACTION_MANUAL_VERIFICATION.equals(intent.getAction())) {
+            showConversation(currentAddress);
+            return;
+        }
         if (ACTION_MANUAL_VERIFICATION.equals(intent.getAction())) {
             inboxConversations = null;
             cachedInboxViews.clear();
@@ -167,12 +225,28 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        String typographySignature = typography.signature();
+        boolean typographyChanged = !typographySignature.equals(appliedTypographySignature);
+        appliedTypographySignature = typographySignature;
+        boolean isDefaultSms = isDefaultSmsApp();
+        boolean defaultSmsStateChanged = defaultSmsStateKnown
+                && lastDefaultSmsState != isDefaultSms;
+        defaultSmsStateKnown = true;
+        lastDefaultSmsState = isDefaultSms;
+        if (defaultSmsStateChanged) cachedInboxViews.clear();
         if (!screenInitialized) {
             screenInitialized = true;
             if (currentAddress == null) showInbox(); else showConversation(currentAddress);
+        } else if (typographyChanged && !showingTrash) {
+            cachedInboxViews.clear();
+            if (currentAddress == null) showInbox(); else showConversation(currentAddress);
+        } else if (defaultSmsStateChanged && currentAddress == null && !showingTrash) {
+            showInbox();
         } else {
             refreshInboxFromProvider();
         }
+        CloudSyncScheduler.scheduleImmediate(this);
+        CloudSyncScheduler.startRealtime(this);
     }
 
     @Override protected void onStart() {
@@ -192,7 +266,7 @@ public final class MainActivity extends Activity {
     }
 
     private void handleBack() {
-        if (!selectedMessageIds.isEmpty()) {
+        if (messageSelectionMode) {
             clearMessageSelection();
         } else if (showingTrash) {
             showInbox();
@@ -267,8 +341,11 @@ public final class MainActivity extends Activity {
 
     private void showInbox() {
         showingTrash = false;
+        messageSelectionMode = false;
         selectedMessageIds.clear();
         currentAddress = null;
+        currentRemoteOrigin = null;
+        activeComposerBody = null;
         if (!cachedInboxViews.isEmpty()) {
             root.removeAllViews();
             for (View view : cachedInboxViews) root.addView(view);
@@ -286,7 +363,7 @@ public final class MainActivity extends Activity {
 
         ImageButton menu = new ImageButton(this);
         menu.setImageResource(android.R.drawable.ic_menu_sort_by_size);
-        menu.setColorFilter(Color.rgb(55, 70, 84));
+        menu.setColorFilter(palette.textPrimary);
         menu.setBackgroundColor(Color.TRANSPARENT);
         menu.setContentDescription("菜单");
         menu.setOnClickListener(this::showInboxMenu);
@@ -294,14 +371,14 @@ public final class MainActivity extends Activity {
 
         EditText search = new EditText(this);
         search.setHint("搜索短信");
-        search.setTextSize(17);
-        search.setTextColor(Color.rgb(37, 52, 68));
-        search.setHintTextColor(Color.rgb(157, 168, 179));
+        setMessageTextSize(search, 17);
+        search.setTextColor(palette.textPrimary);
+        search.setHintTextColor(palette.textMuted);
         search.setSingleLine(true);
         search.setCompoundDrawablesWithIntrinsicBounds(android.R.drawable.ic_menu_search, 0, 0, 0);
         search.setCompoundDrawablePadding(dp(10));
         search.setPadding(dp(18), 0, dp(18), 0);
-        search.setBackground(rounded(Color.rgb(238, 243, 248), 28));
+        search.setBackground(rounded(palette.surfaceMuted, 28));
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence value, int start, int before, int count) {
@@ -318,7 +395,7 @@ public final class MainActivity extends Activity {
         if (!isDefaultSmsApp()) {
             TextView banner = text("设为默认短信应用，才能读取、接收和保存短信。点此继续", 14, Color.WHITE);
             banner.setPadding(dp(14), dp(12), dp(14), dp(12));
-            banner.setBackgroundColor(Color.rgb(103, 71, 245));
+            banner.setBackgroundColor(palette.violet);
             banner.setOnClickListener(v -> ensureSmsRole());
             root.addView(banner, matchWrap(dp(8)));
         }
@@ -359,12 +436,22 @@ public final class MainActivity extends Activity {
             JSONArray values = new JSONArray(raw);
             for (int i = 0; i < values.length(); i++) {
                 JSONObject value = values.getJSONObject(i);
+                CloudMessageOriginStore.Origin origin = value.has("sourceDeviceId")
+                        ? new CloudMessageOriginStore.Origin(
+                                value.optString("sourceDeviceId", null),
+                                value.optString("sourceDeviceName", null),
+                                value.optInt("sourceSubscriptionId", -1),
+                                value.optString("sourceLineNumber", null),
+                                value.optInt("sourceSimSlot", -1))
+                        : (value.isNull("sourceDeviceName") ? null
+                                : CloudMessageOriginStore.Origin.deviceOnly(
+                                        value.optString("sourceDeviceName", null)));
                 result.add(new SmsModels.Conversation(
                         value.getString("address"), value.optString("preview", ""),
                         value.getLong("date"), value.optInt("unread", 0),
                         value.optInt("subscriptionId", SubscriptionManager.INVALID_SUBSCRIPTION_ID),
                         value.optLong("latestMessageId", -1),
-                        value.optInt("latestMessageType", Telephony.Sms.MESSAGE_TYPE_INBOX)));
+                        value.optInt("latestMessageType", Telephony.Sms.MESSAGE_TYPE_INBOX), origin));
             }
         } catch (Exception ignored) {
             return new ArrayList<>();
@@ -378,14 +465,22 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < count; i++) {
             SmsModels.Conversation conversation = conversations.get(i);
             try {
-                values.put(new JSONObject()
+                JSONObject value = new JSONObject()
                         .put("address", conversation.address())
                         .put("preview", conversation.preview())
                         .put("date", conversation.date())
                         .put("unread", conversation.unread())
                         .put("subscriptionId", conversation.subscriptionId())
                         .put("latestMessageId", conversation.latestMessageId())
-                        .put("latestMessageType", conversation.latestMessageType()));
+                        .put("latestMessageType", conversation.latestMessageType())
+                        .put("sourceDeviceName", conversation.sourceDeviceName());
+                if (conversation.origin() != null) {
+                    value.put("sourceDeviceId", conversation.origin().deviceId)
+                            .put("sourceSubscriptionId", conversation.origin().subscriptionId)
+                            .put("sourceLineNumber", conversation.origin().lineNumber)
+                            .put("sourceSimSlot", conversation.origin().simSlot);
+                }
+                values.put(value);
             } catch (Exception ignored) {}
         }
         getSharedPreferences(SNAPSHOT_PREFS, MODE_PRIVATE)
@@ -403,7 +498,8 @@ public final class MainActivity extends Activity {
                     || left.date() != right.date() || left.unread() != right.unread()
                     || left.subscriptionId() != right.subscriptionId()
                     || left.latestMessageId() != right.latestMessageId()
-                    || left.latestMessageType() != right.latestMessageType()) return false;
+                    || left.latestMessageType() != right.latestMessageType()
+                    || !sameOrigin(left.origin(), right.origin())) return false;
         }
         return true;
     }
@@ -449,9 +545,10 @@ public final class MainActivity extends Activity {
         ListView list = new ListView(this);
         inboxList = list;
         list.setClipToPadding(false);
-        list.setPadding(0, 0, 0, dp(88));
+        list.setPadding(0, 0, dp(EDGE_SCROLLBAR_GUTTER_DP), dp(88));
         list.setDivider(null);
         list.setSelector(android.R.color.transparent);
+        list.setVerticalScrollBarEnabled(false);
         boolean[] revealedRows = new boolean[animateRows ? Math.min(10, conversations.size()) : 0];
         list.setAdapter(new BaseAdapter() {
             @Override public int getCount() { return conversations.size(); }
@@ -476,25 +573,53 @@ public final class MainActivity extends Activity {
         });
         TextView empty = text(inboxConversations != null && inboxConversations.isEmpty()
                 ? "这里还没有短信\n点右下角开始一段新对话"
-                : "没有找到相关短信", 17, Color.rgb(113, 126, 139));
+                : "没有找到相关短信", 17, palette.textMuted);
         empty.setGravity(Gravity.CENTER);
         frame.addView(empty, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         list.setEmptyView(empty);
         frame.addView(list, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        View scrollbarThumb = new View(this);
+        scrollbarThumb.setBackground(rounded(palette.scrollThumb, 2));
+        scrollbarThumb.setElevation(dp(12));
+        scrollbarThumb.setAlpha(0f);
+        scrollbarThumb.setVisibility(View.INVISIBLE);
+        FrameLayout.LayoutParams scrollbarParams = new FrameLayout.LayoutParams(
+                dp(2), dp(44), Gravity.END | Gravity.TOP);
+        scrollbarParams.setMargins(0, 0, dp(2), 0);
+        frame.addView(scrollbarThumb, scrollbarParams);
+        list.setOnScrollListener(new AbsListView.OnScrollListener() {
+            @Override public void onScrollStateChanged(AbsListView view, int state) {
+                scrollbarThumb.animate().cancel();
+                if (state == SCROLL_STATE_IDLE) {
+                    scrollbarThumb.animate().alpha(0f).setStartDelay(650L).setDuration(250L)
+                            .withEndAction(() -> scrollbarThumb.setVisibility(View.INVISIBLE))
+                            .start();
+                } else {
+                    scrollbarThumb.setVisibility(View.VISIBLE);
+                    scrollbarThumb.setAlpha(1f);
+                }
+            }
+
+            @Override public void onScroll(
+                    AbsListView view, int firstVisible, int visibleCount, int totalCount) {
+                updateInboxScrollbar(scrollbarThumb, view, firstVisible, visibleCount, totalCount);
+            }
+        });
         restoreInboxScrollPosition(list, conversations);
 
         ImageButton compose = new ImageButton(this);
         compose.setImageResource(android.R.drawable.ic_input_add);
         compose.setColorFilter(Color.WHITE);
-        compose.setBackground(rounded(Color.rgb(33, 105, 255), 30));
+        compose.setBackground(rounded(palette.accent, 30));
         compose.setElevation(dp(10));
         compose.setContentDescription("新短信");
         compose.setOnClickListener(v -> showComposer());
         FrameLayout.LayoutParams composeParams = new FrameLayout.LayoutParams(dp(58), dp(58),
                 Gravity.END | Gravity.BOTTOM);
-        composeParams.setMargins(0, 0, dp(8), dp(16));
+        composeParams.setMargins(0, 0, dp(8 + EDGE_SCROLLBAR_GUTTER_DP), dp(16));
         frame.addView(compose, composeParams);
         if (motionEnabled()) {
             compose.setAlpha(0f);
@@ -504,7 +629,31 @@ public final class MainActivity extends Activity {
                     .setStartDelay(90L).setDuration(260L)
                     .setInterpolator(new OvershootInterpolator(0.9f)).start());
         }
-        root.addView(frame, matchMatch());
+        // Extend only the inbox frame through the root's right content inset to the screen edge.
+        LinearLayout.LayoutParams frameParams = new LinearLayout.LayoutParams(
+                getResources().getDisplayMetrics().widthPixels - root.getPaddingLeft(), 0, 1);
+        root.addView(frame, frameParams);
+    }
+
+    private void updateInboxScrollbar(View thumb, AbsListView list, int firstVisible,
+            int visibleCount, int totalCount) {
+        int trackHeight = list.getHeight();
+        if (trackHeight <= 0 || visibleCount <= 0 || totalCount <= visibleCount) {
+            // Keep the gutter measured during the first layout; GONE would leave a 0px thumb.
+            thumb.setVisibility(View.INVISIBLE);
+            return;
+        }
+        thumb.setVisibility(View.VISIBLE);
+        thumb.bringToFront();
+        int thumbHeight = Math.max(dp(44), Math.round(
+                trackHeight * (visibleCount / (float) totalCount)));
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) thumb.getLayoutParams();
+        if (params.height != thumbHeight) {
+            params.height = thumbHeight;
+            thumb.setLayoutParams(params);
+        }
+        float progress = firstVisible / (float) Math.max(1, totalCount - visibleCount);
+        thumb.setTranslationY(Math.round((trackHeight - thumbHeight) * progress));
     }
 
     private View createConversationRow(SmsModels.Conversation conversation) {
@@ -537,16 +686,21 @@ public final class MainActivity extends Activity {
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
         copy.setPadding(dp(14), 0, dp(8), 0);
-        TextView address = text(displayName(conversation.address()), 18, Color.rgb(41, 57, 72));
+        TextView address = messageText(
+                displayName(conversation.address()), 18, palette.textPrimary);
         address.setSingleLine(true);
         address.setEllipsize(android.text.TextUtils.TruncateAt.END);
         address.setTypeface(Typeface.DEFAULT, conversation.unread() > 0 ? Typeface.BOLD : Typeface.NORMAL);
-        TextView preview = text(conversation.preview(), 15, conversation.unread() > 0
-                ? Color.rgb(53, 69, 83) : Color.rgb(123, 138, 151));
+        String previewText = conversation.origin() == null
+                ? conversation.preview()
+                : (conversation.latestIsOutgoing() ? "通过 " : "来自 ")
+                        + conversation.origin().displayLabel() + " · " + conversation.preview();
+        TextView preview = messageText(previewText, 15, conversation.unread() > 0
+                ? palette.textSecondary : palette.textMuted);
         preview.setMaxLines(2);
         preview.setEllipsize(android.text.TextUtils.TruncateAt.END);
         preview.setIncludeFontPadding(false);
-        preview.setLineSpacing(dp(1), 1f);
+        preview.setLineSpacing(0, typography.lineSpacingMultiplier());
         preview.setTypeface(Typeface.DEFAULT, conversation.unread() > 0 ? Typeface.BOLD : Typeface.NORMAL);
         copy.addView(address);
         copy.addView(preview);
@@ -559,21 +713,21 @@ public final class MainActivity extends Activity {
         LinearLayout meta = new LinearLayout(this);
         meta.setOrientation(LinearLayout.VERTICAL);
         meta.setGravity(Gravity.END | Gravity.TOP);
-        TextView time = text(inboxTime(conversation.date()), 13, conversation.unread() > 0
-                ? Color.rgb(53, 69, 83) : Color.rgb(161, 171, 180));
+        TextView time = messageText(inboxTime(conversation.date()), 13, conversation.unread() > 0
+                ? palette.textSecondary : palette.textMuted);
         time.setGravity(Gravity.END);
         meta.addView(time);
         LinearLayout status = row();
         status.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         Integer slot = subscriptionSlots.get(conversation.subscriptionId());
         if (slot != null) {
-            TextView sim = text("SIM " + slot, 9, slot == 1
-                    ? Color.rgb(24, 91, 170) : Color.rgb(102, 67, 181));
+            TextView sim = messageText("SIM " + slot, 9, slot == 1
+                    ? palette.verificationText : palette.violetText);
             sim.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             sim.setGravity(Gravity.CENTER);
             sim.setPadding(dp(6), dp(2), dp(6), dp(2));
             sim.setBackground(rounded(slot == 1
-                    ? Color.rgb(222, 237, 255) : Color.rgb(236, 226, 255), 6));
+                    ? palette.verificationSurface : palette.violetSurface, 6));
             status.addView(sim, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, dp(18)));
         }
@@ -598,12 +752,12 @@ public final class MainActivity extends Activity {
         LinearLayout card = row();
         card.setGravity(Gravity.CENTER_VERTICAL);
         card.setPadding(dp(7), dp(3), dp(9), dp(3));
-        card.setBackground(rounded(Color.rgb(236, 244, 255), 10));
+        card.setBackground(rounded(palette.verificationSurface, 10));
         ImageView icon = new ImageView(this);
         icon.setImageResource(R.drawable.ic_copy_code);
         icon.setContentDescription("复制验证码");
         card.addView(icon, new LinearLayout.LayoutParams(dp(17), dp(17)));
-        TextView code = text(verification.code(), 16, Color.rgb(25, 79, 158));
+        TextView code = text(verification.code(), 16, palette.verificationText);
         code.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         code.setLetterSpacing(0.06f);
         code.setSingleLine(true);
@@ -641,35 +795,41 @@ public final class MainActivity extends Activity {
         selectedMessageIds.clear();
         stashInboxViews();
         currentAddress = "";
+        currentRemoteOrigin = null;
+        activeComposerBody = null;
         root.removeAllViews();
         addConversationHeader("新短信");
-        TextView recipientLabel = text("发送给", 13, Color.rgb(103, 118, 132));
+        TextView recipientLabel = text("发送给", 13, palette.textSecondary);
         recipientLabel.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         recipientLabel.setPadding(dp(4), dp(12), 0, dp(7));
         root.addView(recipientLabel);
         LinearLayout recipient = row();
         recipient.setGravity(Gravity.CENTER_VERTICAL);
         recipient.setPadding(dp(14), 0, dp(6), 0);
-        recipient.setBackground(rounded(Color.rgb(238, 243, 248), 22));
+        recipient.setBackground(rounded(palette.surfaceMuted, 22));
         EditText address = new EditText(this);
         composerAddressInput = address;
         address.setHint("输入姓名或手机号码");
-        address.setTextSize(16);
+        setMessageTextSize(address, 16);
+        address.setTextColor(palette.textPrimary);
+        address.setHintTextColor(palette.textMuted);
         address.setSingleLine(true);
         address.setPadding(dp(4), 0, dp(8), 0);
         address.setBackgroundColor(Color.TRANSPARENT);
         address.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
-        recipient.addView(address, new LinearLayout.LayoutParams(0, dp(52), 1));
+        address.setMinHeight(dp(52));
+        recipient.addView(address, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         Button contacts = new Button(this);
         contacts.setText("通讯录");
         contacts.setTextSize(14);
-        contacts.setTextColor(Color.rgb(33, 105, 255));
+        contacts.setTextColor(palette.accentText);
         contacts.setAllCaps(false);
-        contacts.setBackground(rounded(Color.rgb(219, 232, 255), 18));
+        contacts.setBackground(rounded(palette.accentSurface, 18));
         contacts.setOnClickListener(v -> openContactPicker());
         recipient.addView(contacts, new LinearLayout.LayoutParams(dp(78), dp(38)));
         LinearLayout.LayoutParams recipientParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         recipientParams.setMargins(0, 0, 0, dp(16));
         root.addView(recipient, recipientParams);
         addComposer(address);
@@ -681,15 +841,27 @@ public final class MainActivity extends Activity {
         menu.getMenu().add("胶囊短信").setEnabled(false);
         menu.getMenu().add("回收站");
         menu.getMenu().add("应用图标");
+        menu.getMenu().add("显示与文字");
         menu.getMenu().add("收件箱自动更新").setEnabled(false);
-        menu.getMenu().add("默认短信应用：已启用").setEnabled(false);
+        boolean isDefaultSms = isDefaultSmsApp();
+        android.view.MenuItem defaultSmsItem = menu.getMenu().add(
+                isDefaultSms ? "默认短信应用：已启用" : "默认短信应用：未启用 · 点按设置");
+        defaultSmsItem.setEnabled(!isDefaultSms);
         menu.setOnMenuItemClickListener(item -> {
+            if (item == defaultSmsItem) {
+                ensureSmsRole();
+                return true;
+            }
             if ("回收站".contentEquals(item.getTitle())) {
                 showTrash();
                 return true;
             }
             if ("应用图标".contentEquals(item.getTitle())) {
                 showLauncherIconChooser();
+                return true;
+            }
+            if ("显示与文字".contentEquals(item.getTitle())) {
+                startActivity(new Intent(this, TypographySettingsActivity.class));
                 return true;
             }
             return false;
@@ -723,21 +895,22 @@ public final class MainActivity extends Activity {
         LinearLayout choice = row();
         choice.setPadding(dp(10), dp(8), dp(8), dp(8));
         choice.setBackground(rounded(checked
-                ? Color.rgb(231, 240, 255) : Color.TRANSPARENT, 18));
+                ? palette.surfaceSelected : Color.TRANSPARENT, 18));
 
         ImageView preview = new ImageView(this);
         preview.setImageResource(style.previewResource);
         preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
         preview.setContentDescription(null);
+        if (checked) preview.setOnClickListener(v -> handleHiddenSettingsTap());
         choice.addView(preview, new LinearLayout.LayoutParams(dp(62), dp(62)));
 
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
         copy.setGravity(Gravity.CENTER_VERTICAL);
         copy.setPadding(dp(12), 0, dp(4), 0);
-        TextView title = text(style.title, 16, Color.rgb(37, 52, 68));
+        TextView title = text(style.title, 16, palette.textPrimary);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        TextView description = text(style.description, 13, Color.rgb(112, 127, 141));
+        TextView description = text(style.description, 13, palette.textMuted);
         copy.addView(title);
         copy.addView(description);
         choice.addView(copy, new LinearLayout.LayoutParams(0, dp(64), 1));
@@ -759,6 +932,16 @@ public final class MainActivity extends Activity {
             dialog.dismiss();
         });
         return choice;
+    }
+
+    private void handleHiddenSettingsTap() {
+        long now = System.currentTimeMillis();
+        if (now - hiddenSettingsLastTapAt > 1_500L) hiddenSettingsTapCount = 0;
+        hiddenSettingsLastTapAt = now;
+        hiddenSettingsTapCount++;
+        if (hiddenSettingsTapCount < 3) return;
+        hiddenSettingsTapCount = 0;
+        startActivity(new Intent(this, AdvancedSettingsActivity.class));
     }
 
     private void stashInboxViews() {
@@ -814,7 +997,7 @@ public final class MainActivity extends Activity {
             if (i >= animatedFrom) animateMessageBubble(
                     bubble, message.isOutgoing(), (i - animatedFrom) * 18L);
         }
-        scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+        scroll.post(this::scrollConversationToBottom);
     }
 
     private void showConversation(String address) {
@@ -827,16 +1010,54 @@ public final class MainActivity extends Activity {
         selectedMessageIds.clear();
         messageRows.clear();
         selectConversationSubscription(address);
+        currentRemoteOrigin = checkSelfPermission(Manifest.permission.READ_SMS)
+                == PackageManager.PERMISSION_GRANTED
+                ? new SmsRepository(this).latestCloudOrigin(address) : null;
         currentAddress = address;
+        activeComposerBody = null;
         root.removeAllViews();
         addConversationHeader(address);
+        FrameLayout scrollFrame = new FrameLayout(this);
         ScrollView scroll = new ScrollView(this);
+        conversationScroll = scroll;
         scroll.setClipToPadding(false);
+        scroll.setPadding(0, 0, dp(CONVERSATION_SCROLLBAR_GUTTER_DP), 0);
+        scroll.setVerticalScrollBarEnabled(false);
         LinearLayout messages = new LinearLayout(this);
+        conversationMessages = messages;
         messages.setOrientation(LinearLayout.VERTICAL);
-        messages.setPadding(dp(2), dp(12), dp(2), dp(18));
+        messages.setPadding(0, dp(12), 0, dp(18));
         scroll.addView(messages);
-        root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        scrollFrame.addView(scroll, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        View scrollbarThumb = new View(this);
+        scrollbarThumb.setBackground(rounded(palette.scrollThumb, 2));
+        scrollbarThumb.setElevation(dp(12));
+        scrollbarThumb.setAlpha(0f);
+        scrollbarThumb.setVisibility(View.INVISIBLE);
+        FrameLayout.LayoutParams scrollbarParams = new FrameLayout.LayoutParams(
+                dp(2), dp(44), Gravity.END | Gravity.TOP);
+        scrollbarParams.setMargins(0, 0, dp(2), 0);
+        scrollFrame.addView(scrollbarThumb, scrollbarParams);
+        Runnable fadeScrollbar = () -> scrollbarThumb.animate().alpha(0f)
+                .setDuration(250L)
+                .withEndAction(() -> scrollbarThumb.setVisibility(View.INVISIBLE))
+                .start();
+        scroll.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
+            scrollbarThumb.removeCallbacks(fadeScrollbar);
+            scrollbarThumb.animate().cancel();
+            if (!updateConversationScrollbar(scrollbarThumb, scroll)) return;
+            scrollbarThumb.setVisibility(View.VISIBLE);
+            scrollbarThumb.setAlpha(1f);
+            scrollbarThumb.postDelayed(fadeScrollbar, 650L);
+        });
+        // Let messages use the physical screen width while keeping the header and composer aligned
+        // to the normal root insets. The right padding remains a dedicated scrollbar safety zone.
+        LinearLayout.LayoutParams scrollFrameParams = new LinearLayout.LayoutParams(
+                getResources().getDisplayMetrics().widthPixels, 0, 1);
+        scrollFrameParams.setMargins(-root.getPaddingLeft(), 0, 0, 0);
+        root.addView(scrollFrame, scrollFrameParams);
         addComposer(null);
         animateScreenIn(1);
 
@@ -854,13 +1075,44 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private boolean updateConversationScrollbar(View thumb, ScrollView scroll) {
+        View content = scroll.getChildAt(0);
+        int trackHeight = scroll.getHeight();
+        int contentHeight = content == null ? 0 : content.getHeight();
+        if (trackHeight <= 0 || contentHeight <= trackHeight) {
+            thumb.setVisibility(View.INVISIBLE);
+            return false;
+        }
+        int thumbHeight = Math.max(dp(44), Math.round(
+                trackHeight * (trackHeight / (float) contentHeight)));
+        thumbHeight = Math.min(trackHeight, thumbHeight);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) thumb.getLayoutParams();
+        if (params.height != thumbHeight) {
+            params.height = thumbHeight;
+            thumb.setLayoutParams(params);
+        }
+        float progress = scroll.getScrollY()
+                / (float) Math.max(1, contentHeight - trackHeight);
+        thumb.setTranslationY(Math.round((trackHeight - thumbHeight) * progress));
+        thumb.bringToFront();
+        return true;
+    }
+
     private void selectConversationSubscription(String address) {
-        if (inboxConversations == null) return;
-        for (SmsModels.Conversation conversation : inboxConversations) {
-            if (conversation.address().equals(address)
-                    && conversation.subscriptionId() != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                selectedSubscriptionId = conversation.subscriptionId();
-                return;
+        if (inboxConversations != null) {
+            for (SmsModels.Conversation conversation : inboxConversations) {
+                if (conversation.address().equals(address)
+                        && conversation.subscriptionId()
+                                != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                    selectedSubscriptionId = conversation.subscriptionId();
+                    return;
+                }
+            }
+        }
+        if (checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) {
+            int latest = new SmsRepository(this).latestSubscriptionId(address);
+            if (latest != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                selectedSubscriptionId = latest;
             }
         }
     }
@@ -869,27 +1121,43 @@ public final class MainActivity extends Activity {
         LinearLayout header = row();
         ImageButton back = new ImageButton(this);
         back.setImageResource(android.R.drawable.ic_menu_revert);
-        back.setColorFilter(Color.rgb(42, 58, 74));
-        back.setBackground(rounded(Color.rgb(238, 243, 248), 22));
+        back.setColorFilter(palette.textPrimary);
+        back.setBackground(rounded(palette.surfaceMuted, 22));
         back.setContentDescription("返回");
         back.setOnClickListener(v -> {
-            if (!selectedMessageIds.isEmpty()) clearMessageSelection();
+            if (messageSelectionMode) clearMessageSelection();
             else { currentAddress = null; showInbox(); }
         });
         LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(dp(44), dp(44));
         backParams.setMargins(0, dp(6), 0, dp(6));
         header.addView(back, backParams);
-        TextView title = text(titleText, 20, Color.rgb(34, 49, 65));
+        TextView select = text("☐", 24, palette.textPrimary);
+        conversationSelect = select;
+        select.setGravity(Gravity.CENTER);
+        select.setBackground(rounded(palette.surfaceMuted, 22));
+        select.setContentDescription("选择短信");
+        select.setOnClickListener(v -> {
+            messageSelectionMode = !messageSelectionMode;
+            if (!messageSelectionMode) selectedMessageIds.clear();
+            refreshMessageSelectionUi();
+            pulse(v);
+        });
+        LinearLayout.LayoutParams selectParams = new LinearLayout.LayoutParams(dp(44), dp(44));
+        selectParams.setMargins(dp(8), dp(6), 0, dp(6));
+        header.addView(select, selectParams);
+        TextView title = messageText(titleText, 20, palette.textPrimary);
         conversationTitle = title;
         title.setGravity(Gravity.CENTER_VERTICAL);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setPadding(dp(14), 0, 0, 0);
-        header.addView(title, new LinearLayout.LayoutParams(0, dp(56), 1));
+        title.setMinHeight(dp(56));
+        header.addView(title, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         ImageButton delete = new ImageButton(this);
         conversationDelete = delete;
         delete.setImageResource(android.R.drawable.ic_menu_delete);
-        delete.setColorFilter(Color.rgb(220, 65, 76));
-        delete.setBackground(rounded(Color.rgb(255, 235, 238), 22));
+        delete.setColorFilter(palette.danger);
+        delete.setBackground(rounded(palette.dangerSurface, 22));
         delete.setContentDescription("删除所选短信");
         delete.setVisibility(View.GONE);
         delete.setOnClickListener(v -> confirmTrashSelectedMessages());
@@ -898,14 +1166,26 @@ public final class MainActivity extends Activity {
     }
 
     private void addComposer(EditText addressInput) {
-        refreshSimChoices();
+        boolean remoteReply = addressInput == null && currentRemoteOrigin != null;
+        CloudMessageOriginStore.Origin remoteRoute = currentRemoteOrigin;
+        if (!remoteReply) refreshSimChoices();
         LinearLayout simSelector = row();
         simSelector.setGravity(Gravity.CENTER_VERTICAL);
         simSelector.setPadding(0, 0, 0, dp(8));
-        TextView simLabel = text("发送号码", 13, Color.rgb(103, 118, 132));
+        TextView simLabel = text("发送号码", 13, palette.textSecondary);
         simLabel.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         simSelector.addView(simLabel, new LinearLayout.LayoutParams(dp(72), dp(44)));
-        for (SimChoice choice : simChoices) {
+        if (remoteReply) {
+            TextView route = text("通过 " + remoteRoute.displayLabel(), 14, Color.WHITE);
+            route.setGravity(Gravity.CENTER);
+            route.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            route.setBackground(rounded(palette.violet, 16));
+            route.setContentDescription("远端发送线路，" + remoteRoute.displayLabel());
+            LinearLayout.LayoutParams routeParams = new LinearLayout.LayoutParams(0, dp(50), 1);
+            routeParams.setMargins(0, 0, dp(8), 0);
+            simSelector.addView(route, routeParams);
+        }
+        for (SimChoice choice : remoteReply ? List.<SimChoice>of() : simChoices) {
             TextView card = simChoiceView(choice);
             LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
                     0, dp(50), 1);
@@ -921,17 +1201,36 @@ public final class MainActivity extends Activity {
                 pulse(card);
             });
         }
-        if (!simChoices.isEmpty()) root.addView(simSelector);
+        if (remoteReply || !simChoices.isEmpty()) root.addView(simSelector);
 
         LinearLayout composer = row();
         composer.setPadding(0, dp(8), 0, dp(4));
         EditText body = new EditText(this);
+        activeComposerBody = body;
         body.setHint("输入短信…");
         body.setMinHeight(dp(48));
         body.setMaxLines(5);
-        body.setTextSize(16);
+        setMessageTextSize(body, 16);
+        body.setLineSpacing(0, typography.lineSpacingMultiplier());
         body.setPadding(dp(18), dp(10), dp(18), dp(10));
-        body.setBackground(rounded(Color.rgb(238, 243, 248), 24));
+        body.setTextColor(palette.textPrimary);
+        body.setHintTextColor(palette.textMuted);
+        body.setBackground(rounded(palette.surfaceMuted, 24));
+        body.setOnTouchListener((view, event) -> {
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN
+                    && !body.hasFocus()) body.requestFocus();
+            return false;
+        });
+        body.setOnFocusChangeListener((view, hasFocus) -> {
+            if (hasFocus) return;
+            body.postDelayed(() -> {
+                if (body.hasFocus()) return;
+                WindowInsets current = root.getRootWindowInsets();
+                if (current == null || !current.isVisible(WindowInsets.Type.ime())) return;
+                android.view.WindowInsetsController controller = root.getWindowInsetsController();
+                if (controller != null) controller.hide(WindowInsets.Type.ime());
+            }, 180L);
+        });
         LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         bodyParams.setMargins(0, 0, dp(10), 0);
@@ -939,7 +1238,7 @@ public final class MainActivity extends Activity {
         ImageButton send = new ImageButton(this);
         send.setImageResource(android.R.drawable.ic_menu_send);
         send.setColorFilter(Color.WHITE);
-        send.setBackground(rounded(Color.rgb(33, 105, 255), 24));
+        send.setBackground(rounded(palette.accent, 24));
         send.setContentDescription("发送");
         send.setOnClickListener(v -> {
             pulse(send);
@@ -950,90 +1249,209 @@ public final class MainActivity extends Activity {
                 return;
             }
             send.setEnabled(false);
+            if (remoteReply) {
+                CloudSyncEngine.sendRemoteAsync(this, remoteRoute, address, message,
+                        (success, error) -> runOnUiThread(() -> {
+                            send.setEnabled(true);
+                            if (error != null || !Boolean.TRUE.equals(success)) {
+                                Toast.makeText(this, error == null ? "远端发送失败"
+                                        : error.getMessage(), Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            body.setText("");
+                            Toast.makeText(this, "已交给 " + remoteRoute.displayLabel()
+                                    + " 发送", Toast.LENGTH_SHORT).show();
+                            CloudSyncScheduler.scheduleImmediate(this);
+                        }));
+                return;
+            }
             SmsSender.send(this, address, message, selectedSubscriptionId,
                     (success, result) -> runOnUiThread(() -> {
                 send.setEnabled(true);
                 Toast.makeText(this, result, Toast.LENGTH_SHORT).show();
-                if (success) { body.setText(""); showConversation(address); }
+                if (success) {
+                    body.setText("");
+                    messageCache.remove(address);
+                    inboxConversations = null;
+                    showConversation(address);
+                }
             }));
         });
         composer.addView(send, new LinearLayout.LayoutParams(dp(48), dp(48)));
         root.addView(composer);
     }
 
+    private void scrollConversationToBottom() {
+        ScrollView scroll = conversationScroll;
+        if (scroll == null || scroll.getChildCount() == 0) return;
+        View content = scroll.getChildAt(0);
+        int bottom = Math.max(0, content.getHeight() - scroll.getHeight());
+        scroll.scrollTo(0, bottom);
+    }
+
     private View messageBubble(SmsModels.Message message) {
         LinearLayout line = row();
         messageRows.put(message.id(), line);
         line.setGravity(message.isOutgoing() ? Gravity.END : Gravity.START);
-        line.setPadding(dp(4), dp(2), dp(4), dp(2));
-        line.setOnLongClickListener(v -> {
-            selectedMessageIds.add(message.id());
-            refreshMessageSelectionUi();
-            pulse(v);
-            return true;
-        });
+        line.setPadding(dp(MESSAGE_EDGE_MARGIN_DP), dp(2),
+                dp(MESSAGE_EDGE_MARGIN_DP), dp(2));
         line.setOnClickListener(v -> {
-            if (selectedMessageIds.isEmpty()) return;
+            if (!messageSelectionMode) return;
             if (!selectedMessageIds.add(message.id())) selectedMessageIds.remove(message.id());
             refreshMessageSelectionUi();
         });
-        TextView bubble = text(message.body(), 16, message.isOutgoing() ? Color.WHITE : Color.rgb(8, 19, 35));
+        TextView bubble = messageText(message.body(), 16,
+                message.isOutgoing() ? Color.WHITE : palette.textPrimary);
         VerificationAnnotationStore.Annotation verification =
                 message.isOutgoing() ? null
                         : verificationAnnotations.resolve(message.id(), message.body());
-        if (verification != null) makeCodeClickable(bubble, message, verification);
-        bubble.setMaxWidth(dp(292));
-        bubble.setLineSpacing(0, 1.08f);
+        bubble.setTextIsSelectable(true);
+        decorateMessageText(bubble, message, verification);
+        bubble.setMaxWidth(Math.round(getResources().getDisplayMetrics().widthPixels
+                * MESSAGE_MAX_WIDTH_FRACTION));
+        bubble.setLineSpacing(0, typography.lineSpacingMultiplier());
         bubble.setPadding(dp(16), dp(11), dp(16), dp(11));
         bubble.setBackground(rounded(message.isOutgoing()
-                ? Color.rgb(33, 105, 255) : Color.rgb(235, 240, 246), 19));
+                ? palette.accent : palette.messageIncoming, 19));
+        LinearLayout stack = new LinearLayout(this);
+        stack.setOrientation(LinearLayout.VERTICAL);
+        stack.setGravity(message.isOutgoing() ? Gravity.END : Gravity.START);
+        stack.addView(bubble);
+        if (message.origin() != null) {
+            TextView origin = messageText((message.isOutgoing() ? "通过 " : "来自 ")
+                            + message.origin().displayLabel(), 11,
+                    palette.textMuted);
+            origin.setPadding(dp(5), dp(2), dp(5), 0);
+            stack.addView(origin);
+        }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         params.setMargins(0, dp(5), 0, dp(5));
-        line.addView(bubble, params);
+        line.addView(stack, params);
         styleMessageRow(line, message.id());
         return line;
     }
 
-    private void makeCodeClickable(TextView bubble, SmsModels.Message message,
-            VerificationAnnotationStore.Annotation verification) {
-        String body = message.body();
-        String code = verification.code();
-        int start = body.indexOf(code);
-        if (start < 0) return;
-        SpannableString styled = new SpannableString(body);
-        VerificationCodeSpan codeSpan = new VerificationCodeSpan();
-        styled.setSpan(codeSpan, start, start + code.length(),
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        styled.setSpan(new ClickableSpan() {
-            @Override public void onClick(View widget) {
-                if (!selectedMessageIds.isEmpty()) {
-                    if (!selectedMessageIds.add(message.id())) {
-                        selectedMessageIds.remove(message.id());
-                    }
-                    refreshMessageSelectionUi();
-                    return;
-                }
-                copyInlineVerificationCode(code, bubble, codeSpan);
-            }
-
-            @Override public void updateDrawState(TextPaint paint) {
-                paint.setUnderlineText(false);
-            }
-        }, start, start + code.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        bubble.setText(styled);
-        bubble.setMovementMethod(LinkMovementMethod.getInstance());
-        bubble.setHighlightColor(Color.TRANSPARENT);
-        bubble.setLinksClickable(true);
-        bubble.setOnLongClickListener(v -> {
-            selectedMessageIds.add(message.id());
-            refreshMessageSelectionUi();
-            pulse(messageRows.get(message.id()));
-            return true;
-        });
+    private boolean sameOrigin(
+            CloudMessageOriginStore.Origin left, CloudMessageOriginStore.Origin right) {
+        if (left == right) return true;
+        if (left == null || right == null) return false;
+        return java.util.Objects.equals(left.deviceId, right.deviceId)
+                && java.util.Objects.equals(left.deviceName, right.deviceName)
+                && left.subscriptionId == right.subscriptionId
+                && java.util.Objects.equals(left.lineNumber, right.lineNumber)
+                && left.simSlot == right.simSlot;
     }
 
-    private static final class VerificationCodeSpan extends ReplacementSpan {
+    private void decorateMessageText(TextView bubble, SmsModels.Message message,
+            VerificationAnnotationStore.Annotation verification) {
+        String body = message.body();
+        SpannableString styled = new SpannableString(body);
+        boolean hasClickableSpan = false;
+        if (verification != null) {
+            String code = verification.code();
+            int start = body.indexOf(code);
+            if (start >= 0) {
+                VerificationCodeSpan codeSpan = new VerificationCodeSpan();
+                styled.setSpan(codeSpan, start, start + code.length(),
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                styled.setSpan(new ClickableSpan() {
+                    @Override public void onClick(View widget) {
+                        if (messageSelectionMode) {
+                            toggleMessageSelection(message.id());
+                            return;
+                        }
+                        copyInlineVerificationCode(code, bubble, codeSpan);
+                    }
+
+                    @Override public void updateDrawState(TextPaint paint) {
+                        paint.setUnderlineText(false);
+                    }
+                }, start, start + code.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                hasClickableSpan = true;
+            }
+        }
+
+        Matcher matcher = Patterns.WEB_URL.matcher(body);
+        while (matcher.find()) {
+            int start = matcher.start();
+            int end = trimUrlEnd(body, start, matcher.end());
+            if (end <= start) continue;
+            String url = body.substring(start, end);
+            styled.setSpan(new ClickableSpan() {
+                @Override public void onClick(View widget) {
+                    if (messageSelectionMode) {
+                        toggleMessageSelection(message.id());
+                        return;
+                    }
+                    showLinkMenu(bubble, url);
+                }
+
+                @Override public void updateDrawState(TextPaint paint) {
+                    paint.setColor(palette.accentText);
+                    paint.setUnderlineText(true);
+                }
+            }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            hasClickableSpan = true;
+        }
+
+        bubble.setText(styled);
+        if (hasClickableSpan) {
+            bubble.setMovementMethod(LinkMovementMethod.getInstance());
+            bubble.setHighlightColor(Color.argb(90, 110, 168, 255));
+            bubble.setLinksClickable(true);
+        }
+    }
+
+    private int trimUrlEnd(String body, int start, int end) {
+        int validEnd = start;
+        while (validEnd < end && isUrlCharacter(body.charAt(validEnd))) {
+            validEnd++;
+        }
+        end = validEnd;
+        while (end > start) {
+            char last = body.charAt(end - 1);
+            if (".:?)]}\"'".indexOf(last) < 0) break;
+            end--;
+        }
+        return end;
+    }
+
+    private boolean isUrlCharacter(char value) {
+        if (value > 0x7f || Character.isWhitespace(value)) return false;
+        return Character.isLetterOrDigit(value)
+                || ":/?#[]@.$&'()*+-_=~%".indexOf(value) >= 0;
+    }
+
+    private void showLinkMenu(TextView anchor, String rawUrl) {
+        String url = rawUrl.matches("(?i)^[a-z][a-z0-9+.-]*://.*")
+                ? rawUrl : "https://" + rawUrl;
+        PopupMenu menu = new PopupMenu(this, anchor, Gravity.END);
+        menu.getMenu().add("浏览器打开");
+        menu.getMenu().add("复制链接");
+        menu.setOnMenuItemClickListener(item -> {
+            if ("浏览器打开".contentEquals(item.getTitle())) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                } catch (RuntimeException error) {
+                    Toast.makeText(this, "没有可打开此链接的应用", Toast.LENGTH_SHORT).show();
+                }
+            } else {
+                ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+                clipboard.setPrimaryClip(ClipData.newPlainText("链接", rawUrl));
+                Toast.makeText(this, "链接已复制", Toast.LENGTH_SHORT).show();
+            }
+            return true;
+        });
+        menu.show();
+    }
+
+    private void toggleMessageSelection(long messageId) {
+        if (!selectedMessageIds.add(messageId)) selectedMessageIds.remove(messageId);
+        refreshMessageSelectionUi();
+    }
+
+    private final class VerificationCodeSpan extends ReplacementSpan {
         private float scale = 1f;
 
         @Override public int getSize(Paint paint, CharSequence text, int start, int end,
@@ -1050,7 +1468,7 @@ public final class MainActivity extends Activity {
             float centerY = y + (metrics.ascent + metrics.descent) / 2f;
             float padding = codePaint.getTextSize() * 0.10f;
             Paint background = new Paint(Paint.ANTI_ALIAS_FLAG);
-            background.setColor(Color.rgb(220, 235, 255));
+            background.setColor(palette.verificationSurface);
 
             canvas.save();
             canvas.scale(scale, scale, x + width / 2f, centerY);
@@ -1063,7 +1481,7 @@ public final class MainActivity extends Activity {
 
         private Paint codePaint(Paint source) {
             Paint result = new Paint(source);
-            result.setColor(Color.rgb(25, 79, 158));
+            result.setColor(palette.verificationText);
             result.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
             return result;
         }
@@ -1082,8 +1500,14 @@ public final class MainActivity extends Activity {
 
     private void refreshMessageSelectionUi() {
         if (conversationTitle != null) {
-            conversationTitle.setText(selectedMessageIds.isEmpty()
-                    ? currentAddress : "已选择 " + selectedMessageIds.size() + " 条");
+            conversationTitle.setText(messageSelectionMode
+                    ? "已选择 " + selectedMessageIds.size() + " 条" : currentAddress);
+        }
+        if (conversationSelect != null) {
+            conversationSelect.setText(messageSelectionMode ? "☑" : "☐");
+            conversationSelect.setTextColor(messageSelectionMode
+                    ? palette.accentText : palette.textPrimary);
+            conversationSelect.setContentDescription(messageSelectionMode ? "退出选择" : "选择短信");
         }
         if (conversationDelete != null) {
             conversationDelete.setVisibility(selectedMessageIds.isEmpty() ? View.GONE : View.VISIBLE);
@@ -1097,12 +1521,14 @@ public final class MainActivity extends Activity {
     private void styleMessageRow(View row, long messageId) {
         boolean selected = selectedMessageIds.contains(messageId);
         row.setBackground(selected
-                ? rounded(Color.rgb(228, 238, 255), 18)
+                ? rounded(palette.surfaceSelected, 18)
                 : rounded(Color.TRANSPARENT, 18));
-        row.setContentDescription(selected ? "已选择的短信" : "短信，长按可选择");
+        row.setContentDescription(selected ? "已选择的短信"
+                : messageSelectionMode ? "短信，点按可选择" : "短信，长按可选择文字");
     }
 
     private void clearMessageSelection() {
+        messageSelectionMode = false;
         selectedMessageIds.clear();
         refreshMessageSelectionUi();
     }
@@ -1177,20 +1603,20 @@ public final class MainActivity extends Activity {
         header.setPadding(0, dp(6), 0, dp(8));
         ImageButton back = new ImageButton(this);
         back.setImageResource(android.R.drawable.ic_menu_revert);
-        back.setColorFilter(Color.rgb(42, 58, 74));
-        back.setBackground(rounded(Color.rgb(238, 243, 248), 22));
+        back.setColorFilter(palette.textPrimary);
+        back.setBackground(rounded(palette.surfaceMuted, 22));
         back.setContentDescription("返回收件箱");
         back.setOnClickListener(v -> showInbox());
         header.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
-        TextView title = text("回收站", 21, Color.rgb(34, 49, 65));
+        TextView title = text("回收站", 21, palette.textPrimary);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setGravity(Gravity.CENTER_VERTICAL);
         title.setPadding(dp(14), 0, 0, 0);
         header.addView(title, new LinearLayout.LayoutParams(0, dp(52), 1));
         ImageButton settings = new ImageButton(this);
         settings.setImageResource(android.R.drawable.ic_menu_preferences);
-        settings.setColorFilter(Color.rgb(55, 70, 84));
-        settings.setBackground(rounded(Color.rgb(238, 243, 248), 22));
+        settings.setColorFilter(palette.textPrimary);
+        settings.setBackground(rounded(palette.surfaceMuted, 22));
         settings.setContentDescription("回收站设置");
         settings.setOnClickListener(v -> showTrashSettings());
         header.addView(settings, new LinearLayout.LayoutParams(dp(44), dp(44)));
@@ -1199,7 +1625,7 @@ public final class MainActivity extends Activity {
         int retention = store.retentionDays();
         TextView summary = text(retention == 0 ? "短信将一直保留，直到手动永久删除"
                 : "已删除短信保留 " + retention + " 天，过期后自动清理",
-                13, Color.rgb(119, 133, 147));
+                13, palette.textMuted);
         summary.setPadding(dp(4), 0, 0, dp(10));
         root.addView(summary);
 
@@ -1215,7 +1641,7 @@ public final class MainActivity extends Activity {
             }
         });
         TextView empty = text("回收站是空的\n删除的短信会暂存在这里", 17,
-                Color.rgb(125, 139, 152));
+                palette.textMuted);
         empty.setGravity(Gravity.CENTER);
         FrameLayout content = new FrameLayout(this);
         content.addView(empty, new FrameLayout.LayoutParams(
@@ -1231,13 +1657,13 @@ public final class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
         row.setPadding(dp(16), dp(13), dp(16), dp(13));
-        row.setBackground(rounded(Color.rgb(242, 246, 250), 18));
+        row.setBackground(rounded(palette.surfaceMuted, 18));
         TextView address = text((entry.isOutgoing() ? "发送给 " : "来自 ")
-                + displayName(entry.address()), 16, Color.rgb(40, 56, 72));
+                + displayName(entry.address()), 16, palette.textPrimary);
         address.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         address.setSingleLine(true);
         address.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        TextView body = text(entry.body(), 15, Color.rgb(91, 106, 120));
+        TextView body = text(entry.body(), 15, palette.textSecondary);
         body.setMaxLines(3);
         body.setEllipsize(android.text.TextUtils.TruncateAt.END);
         body.setPadding(0, dp(5), 0, dp(7));
@@ -1245,7 +1671,7 @@ public final class MainActivity extends Activity {
                 + "  ·  点击管理";
         Integer slot = subscriptionSlots.get(entry.subscriptionId());
         if (slot != null) metaText += "  ·  SIM " + slot;
-        TextView meta = text(metaText, 12, Color.rgb(145, 156, 166));
+        TextView meta = text(metaText, 12, palette.textMuted);
         row.addView(address);
         row.addView(body);
         row.addView(meta);
@@ -1392,14 +1818,28 @@ public final class MainActivity extends Activity {
     private void refreshInboxFromProvider() {
         if (checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return;
         int generation = ++providerRefreshGeneration;
+        String openAddress = currentAddress;
         io.execute(() -> {
-            List<SmsModels.Conversation> conversations = new SmsRepository(this).conversations();
+            SmsRepository repository = new SmsRepository(this);
+            List<SmsModels.Conversation> conversations = repository.conversations();
+            List<SmsModels.Message> openMessages = null;
+            if (openAddress != null && !openAddress.isBlank()) {
+                repository.markRead(openAddress);
+                openMessages = repository.recentMessages(openAddress, 40);
+            }
             saveInboxSnapshot(conversations);
+            List<SmsModels.Message> refreshedOpenMessages = openMessages;
             runOnUiThread(() -> {
                 if (generation != providerRefreshGeneration) return;
                 boolean changed = !sameConversations(inboxConversations, conversations);
                 inboxConversations = conversations;
                 cachedInboxViews.clear();
+                if (refreshedOpenMessages != null && openAddress.equals(currentAddress)
+                        && conversationMessages != null && conversationScroll != null) {
+                    messageCache.put(openAddress, refreshedOpenMessages);
+                    renderMessages(conversationMessages, conversationScroll, refreshedOpenMessages);
+                    return;
+                }
                 if (changed && currentAddress == null && inboxFrame != null) {
                     refreshSubscriptionSlots();
                     renderConversationFrame(conversations);
@@ -1441,7 +1881,7 @@ public final class MainActivity extends Activity {
 
     private TextView simChoiceView(SimChoice choice) {
         TextView card = text("SIM " + choice.slot + "\n" + choice.number, 12,
-                Color.rgb(74, 89, 104));
+                palette.textSecondary);
         card.setGravity(Gravity.CENTER);
         card.setTag(choice);
         styleSimChoice(card, choice);
@@ -1450,11 +1890,11 @@ public final class MainActivity extends Activity {
 
     private void styleSimChoice(TextView card, SimChoice choice) {
         boolean selected = choice.subscriptionId == selectedSubscriptionId;
-        card.setTextColor(selected ? Color.WHITE : Color.rgb(69, 84, 99));
+        card.setTextColor(selected ? Color.WHITE : palette.textSecondary);
         card.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
         card.setBackground(rounded(selected
-                ? (choice.slot == 1 ? Color.rgb(33, 105, 255) : Color.rgb(112, 76, 202))
-                : Color.rgb(238, 243, 248), 16));
+                ? (choice.slot == 1 ? palette.accent : palette.violet)
+                : palette.surfaceMuted, 16));
         card.setContentDescription("SIM " + choice.slot + "，" + choice.number
                 + (selected ? "，已选择" : ""));
     }
@@ -1578,17 +2018,8 @@ public final class MainActivity extends Activity {
     }
 
     private int avatarColor(String key) {
-        int[] colors = {
-                Color.rgb(255, 101, 111),
-                Color.rgb(255, 139, 93),
-                Color.rgb(29, 198, 180),
-                Color.rgb(102, 199, 100),
-                Color.rgb(248, 180, 38),
-                Color.rgb(75, 120, 245),
-                Color.rgb(130, 88, 230)
-        };
         int hash = key == null ? 0 : key.hashCode();
-        return colors[(hash & 0x7fffffff) % colors.length];
+        return palette.avatar(hash);
     }
 
     private GradientDrawable rounded(int color, int radiusDp) {
@@ -1613,13 +2044,25 @@ public final class MainActivity extends Activity {
         return view;
     }
 
+    private TextView messageText(String value, float baseSp, int color) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        setMessageTextSize(view, baseSp);
+        view.setTextColor(color);
+        return view;
+    }
+
+    private void setMessageTextSize(TextView view, float baseSp) {
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, typography.scaledSp(baseSp));
+    }
+
     private Button pillButton(String label) {
         Button button = new Button(this);
         button.setText(label);
         button.setTextColor(Color.WHITE);
         button.setTextSize(14);
         button.setAllCaps(false);
-        button.setBackgroundColor(Color.rgb(8, 124, 240));
+        button.setBackgroundColor(palette.accent);
         return button;
     }
 

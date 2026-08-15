@@ -7,6 +7,9 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.telephony.SmsManager;
 import android.telephony.SubscriptionManager;
+import android.provider.Telephony;
+
+import io.github.venompool888.capsulesms.sync.CloudSyncEngine;
 
 import java.util.ArrayList;
 
@@ -17,13 +20,18 @@ public final class SmsSender {
         void onResult(boolean success, String message);
     }
 
-    public static void send(
+    public static boolean send(
             Context context, String address, String body, int subscriptionId, Callback callback) {
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override public void onReceive(Context receiverContext, Intent intent) {
                 boolean success = getResultCode() == android.app.Activity.RESULT_OK;
-                if (success) SmsRepository.saveSent(
-                        context, address, body, System.currentTimeMillis(), subscriptionId);
+                if (success) {
+                    long timestamp = System.currentTimeMillis();
+                    SmsRepository.saveSent(context, address, body, timestamp, subscriptionId);
+                    CloudSyncEngine.uploadAsync(
+                            context, address, body, timestamp, subscriptionId,
+                            Telephony.Sms.MESSAGE_TYPE_SENT);
+                }
                 try { context.unregisterReceiver(this); } catch (IllegalArgumentException ignored) {}
                 callback.onResult(success, success ? "已发送" : "发送失败（" + getResultCode() + "）");
             }
@@ -39,13 +47,20 @@ public final class SmsSender {
             manager = manager.createForSubscriptionId(subscriptionId);
         }
         ArrayList<String> parts = manager.divideMessage(body);
-        if (parts.size() == 1) {
-            manager.sendTextMessage(address, null, body, sent, null);
-        } else {
-            ArrayList<PendingIntent> intents = new ArrayList<>();
-            for (int i = 0; i < parts.size() - 1; i++) intents.add(null);
-            intents.add(sent);
-            manager.sendMultipartTextMessage(address, null, parts, intents, null);
+        try {
+            if (parts.size() == 1) {
+                manager.sendTextMessage(address, null, body, sent, null);
+            } else {
+                ArrayList<PendingIntent> intents = new ArrayList<>();
+                for (int i = 0; i < parts.size() - 1; i++) intents.add(null);
+                intents.add(sent);
+                manager.sendMultipartTextMessage(address, null, parts, intents, null);
+            }
+            return true;
+        } catch (RuntimeException error) {
+            try { context.unregisterReceiver(receiver); } catch (IllegalArgumentException ignored) {}
+            callback.onResult(false, "发送失败（" + error.getMessage() + "）");
+            return false;
         }
     }
 

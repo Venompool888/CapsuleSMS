@@ -1,0 +1,9 @@
+[Unit]
+Description=Capsule SMS Sync tailnet-only HTTP socket
+
+[Socket]
+ListenStream=100.102.128.28:8445
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

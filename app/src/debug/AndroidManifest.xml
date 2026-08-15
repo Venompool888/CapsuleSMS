@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".sms.DebugSmsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.venompool888.capsulesms.debug.SIMULATE_SMS" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".sync.CloudSyncDebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.venompool888.capsulesms.debug.CONNECT_CLOUD" />
+                <action android:name="io.github.venompool888.capsulesms.debug.ENABLE_ALL_ROUTES" />
+                <action android:name="io.github.venompool888.capsulesms.debug.SYNC_CLOUD" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
