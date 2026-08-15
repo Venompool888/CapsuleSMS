@@ -371,7 +371,7 @@ public final class MainActivity extends Activity {
 
         EditText search = new EditText(this);
         search.setHint("搜索短信");
-        setMessageTextSize(search, 17);
+        setInboxTextSize(search, 17);
         search.setTextColor(palette.textPrimary);
         search.setHintTextColor(palette.textMuted);
         search.setSingleLine(true);
@@ -659,8 +659,9 @@ public final class MainActivity extends Activity {
     private View createConversationRow(SmsModels.Conversation conversation) {
         LinearLayout item = row();
         item.setGravity(Gravity.TOP);
-        item.setMinimumHeight(dp(82));
-        item.setPadding(dp(2), dp(10), dp(2), dp(10));
+        int itemPadding = typography.inboxItemVerticalPaddingDp();
+        item.setMinimumHeight(dp(54 + itemPadding * 2));
+        item.setPadding(dp(2), dp(itemPadding), dp(2), dp(itemPadding));
 
         FrameLayout avatar = new FrameLayout(this);
         avatar.setBackground(rounded(avatarColor(conversation.address()), 28));
@@ -686,7 +687,7 @@ public final class MainActivity extends Activity {
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
         copy.setPadding(dp(14), 0, dp(8), 0);
-        TextView address = messageText(
+        TextView address = inboxText(
                 displayName(conversation.address()), 18, palette.textPrimary);
         address.setSingleLine(true);
         address.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -695,12 +696,12 @@ public final class MainActivity extends Activity {
                 ? conversation.preview()
                 : (conversation.latestIsOutgoing() ? "通过 " : "来自 ")
                         + conversation.origin().displayLabel() + " · " + conversation.preview();
-        TextView preview = messageText(previewText, 15, conversation.unread() > 0
+        TextView preview = inboxText(previewText, 15, conversation.unread() > 0
                 ? palette.textSecondary : palette.textMuted);
         preview.setMaxLines(2);
         preview.setEllipsize(android.text.TextUtils.TruncateAt.END);
         preview.setIncludeFontPadding(false);
-        preview.setLineSpacing(0, typography.lineSpacingMultiplier());
+        preview.setLineSpacing(0, typography.inboxLineSpacingMultiplier());
         preview.setTypeface(Typeface.DEFAULT, conversation.unread() > 0 ? Typeface.BOLD : Typeface.NORMAL);
         copy.addView(address);
         copy.addView(preview);
@@ -713,7 +714,7 @@ public final class MainActivity extends Activity {
         LinearLayout meta = new LinearLayout(this);
         meta.setOrientation(LinearLayout.VERTICAL);
         meta.setGravity(Gravity.END | Gravity.TOP);
-        TextView time = messageText(inboxTime(conversation.date()), 13, conversation.unread() > 0
+        TextView time = inboxText(inboxTime(conversation.date()), 13, conversation.unread() > 0
                 ? palette.textSecondary : palette.textMuted);
         time.setGravity(Gravity.END);
         meta.addView(time);
@@ -721,7 +722,7 @@ public final class MainActivity extends Activity {
         status.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         Integer slot = subscriptionSlots.get(conversation.subscriptionId());
         if (slot != null) {
-            TextView sim = messageText("SIM " + slot, 9, slot == 1
+            TextView sim = inboxText("SIM " + slot, 9, slot == 1
                     ? palette.verificationText : palette.violetText);
             sim.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             sim.setGravity(Gravity.CENTER);
@@ -810,7 +811,7 @@ public final class MainActivity extends Activity {
         EditText address = new EditText(this);
         composerAddressInput = address;
         address.setHint("输入姓名或手机号码");
-        setMessageTextSize(address, 16);
+        setConversationTextSize(address, 16);
         address.setTextColor(palette.textPrimary);
         address.setHintTextColor(palette.textMuted);
         address.setSingleLine(true);
@@ -1145,7 +1146,7 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams selectParams = new LinearLayout.LayoutParams(dp(44), dp(44));
         selectParams.setMargins(dp(8), dp(6), 0, dp(6));
         header.addView(select, selectParams);
-        TextView title = messageText(titleText, 20, palette.textPrimary);
+        TextView title = conversationText(titleText, 20, palette.textPrimary);
         conversationTitle = title;
         title.setGravity(Gravity.CENTER_VERTICAL);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
@@ -1210,8 +1211,8 @@ public final class MainActivity extends Activity {
         body.setHint("输入短信…");
         body.setMinHeight(dp(48));
         body.setMaxLines(5);
-        setMessageTextSize(body, 16);
-        body.setLineSpacing(0, typography.lineSpacingMultiplier());
+        setConversationTextSize(body, 16);
+        body.setLineSpacing(0, typography.conversationLineSpacingMultiplier());
         body.setPadding(dp(18), dp(10), dp(18), dp(10));
         body.setTextColor(palette.textPrimary);
         body.setHintTextColor(palette.textMuted);
@@ -1300,7 +1301,7 @@ public final class MainActivity extends Activity {
             if (!selectedMessageIds.add(message.id())) selectedMessageIds.remove(message.id());
             refreshMessageSelectionUi();
         });
-        TextView bubble = messageText(message.body(), 16,
+        TextView bubble = conversationText(message.body(), 16,
                 message.isOutgoing() ? Color.WHITE : palette.textPrimary);
         VerificationAnnotationStore.Annotation verification =
                 message.isOutgoing() ? null
@@ -1309,7 +1310,7 @@ public final class MainActivity extends Activity {
         decorateMessageText(bubble, message, verification);
         bubble.setMaxWidth(Math.round(getResources().getDisplayMetrics().widthPixels
                 * MESSAGE_MAX_WIDTH_FRACTION));
-        bubble.setLineSpacing(0, typography.lineSpacingMultiplier());
+        bubble.setLineSpacing(0, typography.conversationLineSpacingMultiplier());
         bubble.setPadding(dp(16), dp(11), dp(16), dp(11));
         bubble.setBackground(rounded(message.isOutgoing()
                 ? palette.accent : palette.messageIncoming, 19));
@@ -1318,7 +1319,7 @@ public final class MainActivity extends Activity {
         stack.setGravity(message.isOutgoing() ? Gravity.END : Gravity.START);
         stack.addView(bubble);
         if (message.origin() != null) {
-            TextView origin = messageText((message.isOutgoing() ? "通过 " : "来自 ")
+            TextView origin = conversationText((message.isOutgoing() ? "通过 " : "来自 ")
                             + message.origin().displayLabel(), 11,
                     palette.textMuted);
             origin.setPadding(dp(5), dp(2), dp(5), 0);
@@ -1326,7 +1327,8 @@ public final class MainActivity extends Activity {
         }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        params.setMargins(0, dp(5), 0, dp(5));
+        int bubbleMargin = typography.bubbleVerticalMarginDp();
+        params.setMargins(0, dp(bubbleMargin), 0, dp(bubbleMargin));
         line.addView(stack, params);
         styleMessageRow(line, message.id());
         return line;
@@ -2044,16 +2046,29 @@ public final class MainActivity extends Activity {
         return view;
     }
 
-    private TextView messageText(String value, float baseSp, int color) {
+    private TextView inboxText(String value, float baseSp, int color) {
         TextView view = new TextView(this);
         view.setText(value);
-        setMessageTextSize(view, baseSp);
+        setInboxTextSize(view, baseSp);
         view.setTextColor(color);
         return view;
     }
 
-    private void setMessageTextSize(TextView view, float baseSp) {
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, typography.scaledSp(baseSp));
+    private TextView conversationText(String value, float baseSp, int color) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        setConversationTextSize(view, baseSp);
+        view.setTextColor(color);
+        return view;
+    }
+
+    private void setInboxTextSize(TextView view, float baseSp) {
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, typography.inboxScaledSp(baseSp));
+    }
+
+    private void setConversationTextSize(TextView view, float baseSp) {
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP,
+                typography.conversationScaledSp(baseSp));
     }
 
     private Button pillButton(String label) {
