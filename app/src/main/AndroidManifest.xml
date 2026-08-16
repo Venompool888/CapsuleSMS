@@ -120,11 +120,23 @@
         </receiver>
 
         <receiver
+            android:name=".sms.MmsDownloadReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".sms.MmsStatusReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".sms.TrashCleanupReceiver"
             android:exported="false" />
 
         <receiver
             android:name=".sms.CopyOtpReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".sms.SmsStatusReceiver"
             android:exported="false" />
 
         <receiver

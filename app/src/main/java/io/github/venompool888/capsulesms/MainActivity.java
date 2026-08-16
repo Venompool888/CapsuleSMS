@@ -24,6 +24,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Telephony;
 import android.provider.ContactsContract;
+import android.provider.OpenableColumns;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
 import android.text.Editable;
@@ -65,6 +66,7 @@ import android.widget.Toast;
 import io.github.venompool888.capsulesms.sms.SmsModels;
 import io.github.venompool888.capsulesms.sms.SmsRepository;
 import io.github.venompool888.capsulesms.sms.SmsSender;
+import io.github.venompool888.capsulesms.sms.MmsSender;
 import io.github.venompool888.capsulesms.sms.CloudMessageOriginStore;
 import io.github.venompool888.capsulesms.sms.TrashCleanupScheduler;
 import io.github.venompool888.capsulesms.sms.TrashStore;
@@ -92,6 +94,7 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_ROLE = 100;
     private static final int REQUEST_PERMISSIONS = 101;
     private static final int REQUEST_CONTACT = 102;
+    private static final int REQUEST_ATTACHMENTS = 103;
     private static final int EDGE_SCROLLBAR_GUTTER_DP = 16;
     private static final int CONVERSATION_SCROLLBAR_GUTTER_DP = 4;
     private static final int MESSAGE_EDGE_MARGIN_DP = 8;
@@ -107,6 +110,8 @@ public final class MainActivity extends Activity {
     private String appliedTypographySignature;
     private LinearLayout root;
     private String currentAddress;
+    private long currentThreadId = -1L;
+    private List<String> currentRecipients = List.of();
     private List<SmsModels.Conversation> inboxConversations;
     private final Map<String, ContactIdentity> contactIdentities = new HashMap<>();
     private final Map<Integer, Integer> subscriptionSlots = new HashMap<>();
@@ -115,6 +120,9 @@ public final class MainActivity extends Activity {
     private CloudMessageOriginStore.Origin currentRemoteOrigin;
     private EditText activeComposerBody;
     private EditText composerAddressInput;
+    private final List<SmsModels.Attachment> pendingAttachments = new ArrayList<>();
+    private TextView attachmentSummary;
+    private ImageButton attachmentButton;
     private FrameLayout inboxFrame;
     private ListView inboxList;
     private String inboxScrollAnchorAddress;
@@ -255,6 +263,7 @@ public final class MainActivity extends Activity {
         super.onStart();
         if (!smsObserverRegistered) {
             getContentResolver().registerContentObserver(Telephony.Sms.CONTENT_URI, true, smsObserver);
+            getContentResolver().registerContentObserver(Telephony.Mms.CONTENT_URI, true, smsObserver);
             smsObserverRegistered = true;
         }
     }
@@ -291,6 +300,8 @@ public final class MainActivity extends Activity {
         Uri data = intent.getData();
         if (data != null && ("sms".equals(data.getScheme()) || "smsto".equals(data.getScheme())
                 || "mms".equals(data.getScheme()) || "mmsto".equals(data.getScheme()))) {
+            currentThreadId = -1L;
+            currentRecipients = List.of();
             currentAddress = data.getSchemeSpecificPart();
         }
     }
@@ -309,6 +320,8 @@ public final class MainActivity extends Activity {
                 Manifest.permission.READ_SMS,
                 Manifest.permission.SEND_SMS,
                 Manifest.permission.RECEIVE_SMS,
+                Manifest.permission.RECEIVE_MMS,
+                Manifest.permission.RECEIVE_WAP_PUSH,
                 Manifest.permission.READ_PHONE_STATE,
                 Manifest.permission.READ_PHONE_NUMBERS,
                 Manifest.permission.POST_NOTIFICATIONS,
@@ -338,6 +351,8 @@ public final class MainActivity extends Activity {
             else Toast.makeText(this, "设为默认短信应用后才能完整收发短信", Toast.LENGTH_LONG).show();
         } else if (requestCode == REQUEST_CONTACT && resultCode == RESULT_OK && data != null) {
             fillRecipientFromContact(data.getData());
+        } else if (requestCode == REQUEST_ATTACHMENTS && resultCode == RESULT_OK && data != null) {
+            receiveSelectedAttachments(data);
         }
     }
 
@@ -346,8 +361,13 @@ public final class MainActivity extends Activity {
         messageSelectionMode = false;
         selectedMessageIds.clear();
         currentAddress = null;
+        currentThreadId = -1L;
+        currentRecipients = List.of();
         currentRemoteOrigin = null;
         activeComposerBody = null;
+        pendingAttachments.clear();
+        attachmentSummary = null;
+        attachmentButton = null;
         if (!cachedInboxViews.isEmpty()) {
             root.removeAllViews();
             for (View view : cachedInboxViews) root.addView(view);
@@ -449,12 +469,16 @@ public final class MainActivity extends Activity {
                         : (value.isNull("sourceDeviceName") ? null
                                 : CloudMessageOriginStore.Origin.deviceOnly(
                                         value.optString("sourceDeviceName", null)));
+                String address = value.getString("address");
                 result.add(new SmsModels.Conversation(
-                        value.getString("address"), value.optString("preview", ""),
-                        value.getLong("date"), value.optInt("unread", 0),
+                        value.optLong("threadId", -1L), address,
+                        jsonStrings(value.optJSONArray("recipients"), address),
+                        value.optString("preview", ""), value.getLong("date"),
+                        value.optInt("unread", 0),
                         value.optInt("subscriptionId", SubscriptionManager.INVALID_SUBSCRIPTION_ID),
                         value.optLong("latestMessageId", -1),
-                        value.optInt("latestMessageType", Telephony.Sms.MESSAGE_TYPE_INBOX), origin));
+                        value.optInt("latestMessageType", Telephony.Sms.MESSAGE_TYPE_INBOX),
+                        value.optBoolean("latestIsMms", false), origin));
             }
         } catch (Exception ignored) {
             return new ArrayList<>();
@@ -469,13 +493,16 @@ public final class MainActivity extends Activity {
             SmsModels.Conversation conversation = conversations.get(i);
             try {
                 JSONObject value = new JSONObject()
+                        .put("threadId", conversation.threadId())
                         .put("address", conversation.address())
+                        .put("recipients", new JSONArray(conversation.recipients()))
                         .put("preview", conversation.preview())
                         .put("date", conversation.date())
                         .put("unread", conversation.unread())
                         .put("subscriptionId", conversation.subscriptionId())
                         .put("latestMessageId", conversation.latestMessageId())
                         .put("latestMessageType", conversation.latestMessageType())
+                        .put("latestIsMms", conversation.latestIsMms())
                         .put("sourceDeviceName", conversation.sourceDeviceName());
                 if (conversation.origin() != null) {
                     value.put("sourceDeviceId", conversation.origin().deviceId)
@@ -497,14 +524,27 @@ public final class MainActivity extends Activity {
             SmsModels.Conversation left = first.get(i);
             SmsModels.Conversation right = second.get(i);
             if (!left.address().equals(right.address())
+                    || left.threadId() != right.threadId()
+                    || !left.recipients().equals(right.recipients())
                     || !left.preview().equals(right.preview())
                     || left.date() != right.date() || left.unread() != right.unread()
                     || left.subscriptionId() != right.subscriptionId()
                     || left.latestMessageId() != right.latestMessageId()
                     || left.latestMessageType() != right.latestMessageType()
+                    || left.latestIsMms() != right.latestIsMms()
                     || !sameOrigin(left.origin(), right.origin())) return false;
         }
         return true;
+    }
+
+    private List<String> jsonStrings(JSONArray values, String fallback) {
+        if (values == null) return List.of(fallback);
+        List<String> result = new ArrayList<>();
+        for (int i = 0; i < values.length(); i++) {
+            String value = values.optString(i, "");
+            if (!value.isBlank()) result.add(value);
+        }
+        return result.isEmpty() ? List.of(fallback) : result;
     }
 
     private boolean sameContacts(
@@ -526,7 +566,8 @@ public final class MainActivity extends Activity {
         if (needle.isEmpty()) return inboxConversations;
         List<SmsModels.Conversation> filtered = new ArrayList<>();
         for (SmsModels.Conversation conversation : inboxConversations) {
-            if (displayName(conversation.address()).toLowerCase(Locale.getDefault()).contains(needle)
+            if (conversationDisplayTitle(conversation.recipients(), conversation.address())
+                            .toLowerCase(Locale.getDefault()).contains(needle)
                     || conversation.address().toLowerCase(Locale.getDefault()).contains(needle)
                     || conversation.preview().toLowerCase(Locale.getDefault()).contains(needle)) {
                 filtered.add(conversation);
@@ -569,7 +610,7 @@ public final class MainActivity extends Activity {
             }
         });
         list.setOnItemClickListener((parent, view, position, id) ->
-                showConversation(conversations.get(position).address()));
+                showConversation(conversations.get(position)));
         list.setOnItemLongClickListener((parent, view, position, id) -> {
             confirmTrashConversation(conversations.get(position));
             return true;
@@ -670,7 +711,9 @@ public final class MainActivity extends Activity {
         FrameLayout avatar = new FrameLayout(this);
         avatar.setBackground(rounded(avatarColor(conversation.address()),
                 layoutProfile.avatarSizeDp / 2));
-        ContactIdentity identity = contactIdentities.get(conversation.address());
+        String primaryRecipient = conversation.recipients().isEmpty()
+                ? conversation.address() : conversation.recipients().get(0);
+        ContactIdentity identity = contactIdentities.get(primaryRecipient);
         if (identity != null && identity.photo != null) {
             ImageView photo = new ImageView(this);
             photo.setImageBitmap(identity.photo);
@@ -681,7 +724,8 @@ public final class MainActivity extends Activity {
             avatar.addView(photo, new FrameLayout.LayoutParams(
                     dp(layoutProfile.avatarSizeDp), dp(layoutProfile.avatarSizeDp), Gravity.CENTER));
         } else {
-            TextView mark = text(initial(displayName(conversation.address())),
+            TextView mark = text(initial(conversationDisplayTitle(
+                            conversation.recipients(), conversation.address())),
                     layoutProfile.avatarTextSp, Color.WHITE);
             mark.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             mark.setGravity(Gravity.CENTER);
@@ -697,8 +741,8 @@ public final class MainActivity extends Activity {
         copy.setOrientation(LinearLayout.VERTICAL);
         copy.setPadding(dp(layoutProfile.copyStartPaddingDp), 0,
                 dp(layoutProfile.copyEndPaddingDp), 0);
-        TextView address = inboxText(
-                displayName(conversation.address()), 18, palette.textPrimary);
+        TextView address = inboxText(conversationDisplayTitle(
+                conversation.recipients(), conversation.address()), 18, palette.textPrimary);
         address.setSingleLine(true);
         address.setEllipsize(android.text.TextUtils.TruncateAt.END);
         address.setTypeface(Typeface.DEFAULT, conversation.unread() > 0 ? Typeface.BOLD : Typeface.NORMAL);
@@ -824,7 +868,7 @@ public final class MainActivity extends Activity {
         recipient.setBackground(rounded(palette.surfaceMuted, 22));
         EditText address = new EditText(this);
         composerAddressInput = address;
-        address.setHint("输入姓名或手机号码");
+        address.setHint("输入号码；多个号码用逗号分隔");
         setConversationTextSize(address, 16);
         address.setTextColor(palette.textPrimary);
         address.setHintTextColor(palette.textMuted);
@@ -994,10 +1038,12 @@ public final class MainActivity extends Activity {
     private void prefetchRecentMessages(List<SmsModels.Conversation> conversations) {
         int count = Math.min(12, conversations.size());
         for (int i = 0; i < count; i++) {
-            String address = conversations.get(i).address();
-            if (messageCache.containsKey(address)) continue;
-            io.execute(() -> messageCache.put(address,
-                    new SmsRepository(this).recentMessages(address, 40)));
+            SmsModels.Conversation conversation = conversations.get(i);
+            String key = cacheKey(conversation.threadId(), conversation.address());
+            if (messageCache.containsKey(key)) continue;
+            io.execute(() -> messageCache.put(key,
+                    new SmsRepository(this).recentMessages(
+                            conversation.threadId(), conversation.address(), 40)));
         }
     }
 
@@ -1024,14 +1070,18 @@ public final class MainActivity extends Activity {
         showingTrash = false;
         selectedMessageIds.clear();
         messageRows.clear();
-        selectConversationSubscription(address);
+        if (currentThreadId <= 0) {
+            currentThreadId = new SmsRepository(this).findThreadId(address);
+        }
+        if (currentRecipients.isEmpty()) currentRecipients = List.of(address);
+        selectConversationSubscription(currentThreadId, address);
         currentRemoteOrigin = checkSelfPermission(Manifest.permission.READ_SMS)
                 == PackageManager.PERMISSION_GRANTED
                 ? new SmsRepository(this).latestCloudOrigin(address) : null;
         currentAddress = address;
         activeComposerBody = null;
         root.removeAllViews();
-        addConversationHeader(address);
+        addConversationHeader(conversationDisplayTitle(currentRecipients, address));
         FrameLayout scrollFrame = new FrameLayout(this);
         ScrollView scroll = new ScrollView(this);
         conversationScroll = scroll;
@@ -1076,18 +1126,25 @@ public final class MainActivity extends Activity {
         addComposer(null);
         animateScreenIn(1);
 
-        List<SmsModels.Message> cachedMessages = messageCache.get(address);
+        String conversationCacheKey = cacheKey(currentThreadId, address);
+        List<SmsModels.Message> cachedMessages = messageCache.get(conversationCacheKey);
         if (cachedMessages != null) renderMessages(messages, scroll, cachedMessages);
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
-            repository.markRead(address);
+            repository.markRead(currentThreadId, address);
             if (cachedMessages != null) return;
-            List<SmsModels.Message> values = repository.recentMessages(address, 40);
-            messageCache.put(address, values);
+            List<SmsModels.Message> values = repository.recentMessages(currentThreadId, address, 40);
+            messageCache.put(conversationCacheKey, values);
             runOnUiThread(() -> {
                 if (address.equals(currentAddress)) renderMessages(messages, scroll, values);
             });
         });
+    }
+
+    private void showConversation(SmsModels.Conversation conversation) {
+        currentThreadId = conversation.threadId();
+        currentRecipients = conversation.recipients();
+        showConversation(conversation.address());
     }
 
     private boolean updateConversationScrollbar(View thumb, ScrollView scroll) {
@@ -1113,7 +1170,7 @@ public final class MainActivity extends Activity {
         return true;
     }
 
-    private void selectConversationSubscription(String address) {
+    private void selectConversationSubscription(long threadId, String address) {
         if (inboxConversations != null) {
             for (SmsModels.Conversation conversation : inboxConversations) {
                 if (conversation.address().equals(address)
@@ -1125,11 +1182,22 @@ public final class MainActivity extends Activity {
             }
         }
         if (checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) {
-            int latest = new SmsRepository(this).latestSubscriptionId(address);
+            int latest = new SmsRepository(this).latestSubscriptionId(threadId, address);
             if (latest != SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
                 selectedSubscriptionId = latest;
             }
         }
+    }
+
+    private String cacheKey(long threadId, String address) {
+        return threadId > 0 ? "thread:" + threadId : "address:" + address;
+    }
+
+    private String conversationDisplayTitle(List<String> recipients, String fallback) {
+        if (recipients == null || recipients.isEmpty()) return displayName(fallback);
+        List<String> names = new ArrayList<>();
+        for (String recipient : recipients) names.add(displayName(recipient));
+        return String.join("、", names);
     }
 
     private void addConversationHeader(String titleText) {
@@ -1218,8 +1286,30 @@ public final class MainActivity extends Activity {
         }
         if (remoteReply || !simChoices.isEmpty()) root.addView(simSelector);
 
+        TextView attachments = text("", 13, palette.textSecondary);
+        attachmentSummary = attachments;
+        attachments.setPadding(dp(14), dp(8), dp(14), dp(8));
+        attachments.setBackground(rounded(palette.surfaceMuted, 14));
+        attachments.setOnClickListener(v -> {
+            pendingAttachments.clear();
+            updateAttachmentSummary();
+        });
+        root.addView(attachments, matchWrap(dp(4)));
+        updateAttachmentSummary();
+
         LinearLayout composer = row();
         composer.setPadding(0, dp(8), 0, dp(4));
+        ImageButton attach = new ImageButton(this);
+        attachmentButton = attach;
+        attach.setImageResource(android.R.drawable.ic_menu_add);
+        attach.setColorFilter(palette.accentText);
+        attach.setBackground(rounded(palette.surfaceMuted, 22));
+        attach.setContentDescription("添加图片、视频或音频");
+        attach.setOnClickListener(v -> openAttachmentPicker());
+        attach.setVisibility(remoteReply ? View.GONE : View.VISIBLE);
+        LinearLayout.LayoutParams attachParams = new LinearLayout.LayoutParams(dp(44), dp(48));
+        attachParams.setMargins(0, 0, dp(8), 0);
+        composer.addView(attach, attachParams);
         EditText body = new EditText(this);
         activeComposerBody = body;
         body.setHint("输入短信…");
@@ -1259,8 +1349,11 @@ public final class MainActivity extends Activity {
             pulse(send);
             String address = addressInput == null ? currentAddress : addressInput.getText().toString().trim();
             String message = body.getText().toString().trim();
-            if (address == null || address.isBlank() || message.isBlank()) {
-                Toast.makeText(this, "请填写收件人和短信内容", Toast.LENGTH_SHORT).show();
+            List<String> recipients = addressInput == null
+                    ? currentRecipients : splitRecipients(address);
+            boolean useMms = !pendingAttachments.isEmpty() || recipients.size() > 1;
+            if (recipients.isEmpty() || (message.isBlank() && pendingAttachments.isEmpty())) {
+                Toast.makeText(this, "请填写收件人和消息内容", Toast.LENGTH_SHORT).show();
                 return;
             }
             send.setEnabled(false);
@@ -1280,13 +1373,32 @@ public final class MainActivity extends Activity {
                         }));
                 return;
             }
+            if (useMms) {
+                List<SmsModels.Attachment> sendingAttachments =
+                        new ArrayList<>(pendingAttachments);
+                io.execute(() -> MmsSender.send(this, recipients, message,
+                        sendingAttachments, selectedSubscriptionId, currentThreadId,
+                        (success, result) -> runOnUiThread(() -> {
+                            send.setEnabled(true);
+                            Toast.makeText(this, result, success
+                                    ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                            if (!success) return;
+                            body.setText("");
+                            pendingAttachments.clear();
+                            updateAttachmentSummary();
+                            messageCache.remove(cacheKey(currentThreadId, address));
+                            inboxConversations = null;
+                            refreshInboxFromProvider();
+                        })));
+                return;
+            }
             SmsSender.send(this, address, message, selectedSubscriptionId,
                     (success, result) -> runOnUiThread(() -> {
                 send.setEnabled(true);
                 Toast.makeText(this, result, Toast.LENGTH_SHORT).show();
                 if (success) {
                     body.setText("");
-                    messageCache.remove(address);
+                    messageCache.remove(cacheKey(currentThreadId, address));
                     inboxConversations = null;
                     showConversation(address);
                 }
@@ -1331,13 +1443,23 @@ public final class MainActivity extends Activity {
         LinearLayout stack = new LinearLayout(this);
         stack.setOrientation(LinearLayout.VERTICAL);
         stack.setGravity(message.isOutgoing() ? Gravity.END : Gravity.START);
-        stack.addView(bubble);
+        if (!message.body().isBlank()) stack.addView(bubble);
+        for (SmsModels.Attachment attachment : message.attachments()) {
+            stack.addView(attachmentView(message, attachment));
+        }
         if (message.origin() != null) {
             TextView origin = conversationText((message.isOutgoing() ? "通过 " : "来自 ")
                             + message.origin().displayLabel(), 11,
                     palette.textMuted);
             origin.setPadding(dp(5), dp(2), dp(5), 0);
             stack.addView(origin);
+        }
+        if (message.isOutgoing() && message.delivery() != SmsModels.Message.Delivery.NONE) {
+            TextView status = conversationText(deliveryLabel(message.delivery()), 11,
+                    message.delivery() == SmsModels.Message.Delivery.FAILED
+                            ? palette.danger : palette.textMuted);
+            status.setPadding(dp(5), dp(2), dp(5), 0);
+            stack.addView(status);
         }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -1346,6 +1468,71 @@ public final class MainActivity extends Activity {
         line.addView(stack, params);
         styleMessageRow(line, message.id());
         return line;
+    }
+
+    private View attachmentView(SmsModels.Message message, SmsModels.Attachment attachment) {
+        if (attachment.isImage()) {
+            ImageView image = new ImageView(this);
+            image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            image.setImageResource(android.R.drawable.ic_menu_gallery);
+            image.setBackground(rounded(palette.surfaceMuted, 16));
+            image.setContentDescription("图片附件 " + attachment.name());
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(210), dp(150));
+            params.setMargins(0, dp(4), 0, dp(2));
+            image.setLayoutParams(params);
+            image.setOnClickListener(v -> openAttachment(message, attachment));
+            io.execute(() -> {
+                Bitmap bitmap = decodeAttachmentPreview(attachment.uri(), 720);
+                if (bitmap != null) image.post(() -> image.setImageBitmap(bitmap));
+            });
+            return image;
+        }
+        String kind = attachment.isVideo() ? "视频" : attachment.isAudio() ? "音频" : "附件";
+        TextView file = conversationText(kind + " · " + attachment.name(), 14,
+                message.isOutgoing() ? Color.WHITE : palette.textPrimary);
+        file.setPadding(dp(14), dp(12), dp(14), dp(12));
+        file.setBackground(rounded(message.isOutgoing()
+                ? palette.accent : palette.messageIncoming, 16));
+        file.setOnClickListener(v -> openAttachment(message, attachment));
+        return file;
+    }
+
+    private Bitmap decodeAttachmentPreview(Uri uri, int maxDimension) {
+        try (InputStream bounds = getContentResolver().openInputStream(uri)) {
+            if (bounds == null) return null;
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inJustDecodeBounds = true;
+            BitmapFactory.decodeStream(bounds, null, options);
+            int sample = 1;
+            while (Math.max(options.outWidth, options.outHeight) / sample > maxDimension) sample *= 2;
+            options.inJustDecodeBounds = false;
+            options.inSampleSize = Math.max(1, sample);
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                return input == null ? null : BitmapFactory.decodeStream(input, null, options);
+            }
+        } catch (Exception ignored) { return null; }
+    }
+
+    private void openAttachment(SmsModels.Message message, SmsModels.Attachment attachment) {
+        if (messageSelectionMode) {
+            toggleMessageSelection(message.id());
+            return;
+        }
+        try {
+            Intent open = new Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(attachment.uri(), attachment.mimeType())
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(open);
+        } catch (RuntimeException error) {
+            Toast.makeText(this, "没有可打开此附件的应用", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private String deliveryLabel(SmsModels.Message.Delivery delivery) {
+        if (delivery == SmsModels.Message.Delivery.SENDING) return "发送中";
+        if (delivery == SmsModels.Message.Delivery.DELIVERED) return "已送达";
+        if (delivery == SmsModels.Message.Delivery.FAILED) return "发送失败";
+        return "已发送";
     }
 
     private boolean sameOrigin(
@@ -1552,9 +1739,13 @@ public final class MainActivity extends Activity {
     private void confirmTrashSelectedMessages() {
         int count = selectedMessageIds.size();
         if (count == 0) return;
+        boolean includesMms = false;
+        for (long id : selectedMessageIds) if (id < 0) includesMms = true;
         new AlertDialog.Builder(this)
                 .setTitle("移到回收站？")
-                .setMessage("已选择 " + count + " 条短信。删除后仍可在回收站恢复。")
+                .setMessage("已选择 " + count + " 条消息。"
+                        + (includesMms ? "普通短信可从回收站恢复；彩信及其附件将永久删除。"
+                                : "删除后仍可在回收站恢复。"))
                 .setNegativeButton("取消", null)
                 .setPositiveButton("移到回收站", (dialog, which) -> moveSelectedMessagesToTrash())
                 .show();
@@ -1563,12 +1754,13 @@ public final class MainActivity extends Activity {
     private void moveSelectedMessagesToTrash() {
         Set<Long> ids = new LinkedHashSet<>(selectedMessageIds);
         String address = currentAddress;
+        long threadId = currentThreadId;
         if (conversationDelete != null) conversationDelete.setEnabled(false);
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
-            int moved = repository.moveToTrash(this, ids);
-            List<SmsModels.Message> remaining = repository.recentMessages(address, 40);
-            messageCache.put(address, remaining);
+            int moved = repository.moveToTrash(this, ids) + repository.deleteSelectedMms(ids);
+            List<SmsModels.Message> remaining = repository.recentMessages(threadId, address, 40);
+            messageCache.put(cacheKey(threadId, address), remaining);
             inboxConversations = null;
             cachedInboxViews.clear();
             runOnUiThread(() -> {
@@ -1582,16 +1774,18 @@ public final class MainActivity extends Activity {
     }
 
     private void confirmTrashConversation(SmsModels.Conversation conversation) {
-        String title = displayName(conversation.address());
+        String title = conversationDisplayTitle(conversation.recipients(), conversation.address());
         new AlertDialog.Builder(this)
                 .setTitle("删除与“" + title + "”的会话？")
-                .setMessage("这段会话中的全部短信都会移到回收站，之后仍可逐条恢复。")
+                .setMessage("普通短信会移到回收站；彩信及其附件将永久删除。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("移到回收站", (dialog, which) -> {
                     io.execute(() -> {
                         int moved = new SmsRepository(this)
-                                .moveConversationToTrash(this, conversation.address());
-                        messageCache.remove(conversation.address());
+                                .moveConversationToTrash(this, conversation.threadId(),
+                                        conversation.address());
+                        messageCache.remove(cacheKey(
+                                conversation.threadId(), conversation.address()));
                         inboxConversations = null;
                         cachedInboxViews.clear();
                         runOnUiThread(() -> {
@@ -1835,13 +2029,14 @@ public final class MainActivity extends Activity {
         if (checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return;
         int generation = ++providerRefreshGeneration;
         String openAddress = currentAddress;
+        long openThreadId = currentThreadId;
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
             List<SmsModels.Conversation> conversations = repository.conversations();
             List<SmsModels.Message> openMessages = null;
             if (openAddress != null && !openAddress.isBlank()) {
-                repository.markRead(openAddress);
-                openMessages = repository.recentMessages(openAddress, 40);
+                repository.markRead(openThreadId, openAddress);
+                openMessages = repository.recentMessages(openThreadId, openAddress, 40);
             }
             saveInboxSnapshot(conversations);
             List<SmsModels.Message> refreshedOpenMessages = openMessages;
@@ -1852,7 +2047,7 @@ public final class MainActivity extends Activity {
                 cachedInboxViews.clear();
                 if (refreshedOpenMessages != null && openAddress.equals(currentAddress)
                         && conversationMessages != null && conversationScroll != null) {
-                    messageCache.put(openAddress, refreshedOpenMessages);
+                    messageCache.put(cacheKey(openThreadId, openAddress), refreshedOpenMessages);
                     renderMessages(conversationMessages, conversationScroll, refreshedOpenMessages);
                     return;
                 }
@@ -1872,6 +2067,87 @@ public final class MainActivity extends Activity {
         }
         Intent pick = new Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI);
         startActivityForResult(pick, REQUEST_CONTACT);
+    }
+
+    private void openAttachmentPicker() {
+        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                        "image/*", "video/*", "audio/*"
+                });
+        startActivityForResult(pick, REQUEST_ATTACHMENTS);
+    }
+
+    private void receiveSelectedAttachments(Intent data) {
+        List<Uri> values = new ArrayList<>();
+        ClipData clip = data.getClipData();
+        if (clip != null) {
+            for (int i = 0; i < clip.getItemCount(); i++) values.add(clip.getItemAt(i).getUri());
+        } else if (data.getData() != null) values.add(data.getData());
+        for (Uri uri : values) {
+            if (uri == null || pendingAttachments.size() >= 10) break;
+            try {
+                getContentResolver().takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (SecurityException ignored) {}
+            String mime = getContentResolver().getType(uri);
+            String name = null;
+            long size = 0L;
+            try (android.database.Cursor cursor = getContentResolver().query(
+                    uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+                    null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    name = cursor.getString(0);
+                    if (!cursor.isNull(1)) size = cursor.getLong(1);
+                }
+            } catch (RuntimeException ignored) {}
+            SmsModels.Attachment attachment = new SmsModels.Attachment(uri, mime, name, size);
+            boolean duplicate = false;
+            for (SmsModels.Attachment existing : pendingAttachments) {
+                if (existing.uri().equals(uri)) duplicate = true;
+            }
+            if (!duplicate) pendingAttachments.add(attachment);
+        }
+        updateAttachmentSummary();
+        if (values.size() > 10) {
+            Toast.makeText(this, "每条彩信最多选择 10 个附件", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void updateAttachmentSummary() {
+        if (attachmentSummary == null) return;
+        if (pendingAttachments.isEmpty()) {
+            attachmentSummary.setText("");
+            attachmentSummary.setVisibility(View.GONE);
+            if (attachmentButton != null) attachmentButton.setContentDescription("添加图片、视频或音频");
+            return;
+        }
+        long total = 0L;
+        List<String> names = new ArrayList<>();
+        for (SmsModels.Attachment attachment : pendingAttachments) {
+            total += attachment.size();
+            names.add(attachment.name());
+        }
+        String size = total >= 1024 * 1024
+                ? String.format(Locale.getDefault(), "%.1f MB", total / 1048576f)
+                : Math.max(1L, total / 1024L) + " KB";
+        attachmentSummary.setText(pendingAttachments.size() + " 个附件 · " + size
+                + "\n" + String.join("、", names) + "\n点按移除全部");
+        attachmentSummary.setVisibility(View.VISIBLE);
+        if (attachmentButton != null) attachmentButton.setContentDescription(
+                "已选择 " + pendingAttachments.size() + " 个附件，继续添加");
+    }
+
+    private List<String> splitRecipients(String raw) {
+        List<String> result = new ArrayList<>();
+        if (raw == null) return result;
+        for (String value : raw.split("[,，;；\\n]+")) {
+            String recipient = value.trim();
+            if (!recipient.isBlank() && !result.contains(recipient)) result.add(recipient);
+        }
+        return result;
     }
 
     private void fillRecipientFromContact(Uri uri) {
@@ -1961,8 +2237,8 @@ public final class MainActivity extends Activity {
             return result;
         }
         for (SmsModels.Conversation conversation : conversations) {
-            String address = conversation.address();
-            if (!looksLikePhoneNumber(address)) continue;
+            for (String address : conversation.recipients()) {
+            if (!looksLikePhoneNumber(address) || result.containsKey(address)) continue;
             Uri lookup = Uri.withAppendedPath(
                     ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(address));
             String[] projection = {
@@ -1978,6 +2254,7 @@ public final class MainActivity extends Activity {
                 result.put(address, new ContactIdentity(name, photo));
             } catch (SecurityException ignored) {
                 return new HashMap<>();
+            }
             }
         }
         return result;

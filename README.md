@@ -19,7 +19,7 @@
 短信不该只是一个堆满通知的旧收件箱。胶囊短信把最常用的动作重新排布：快速找到对话、在列表里识别验证码、双卡选择发送号码、误删后随时找回。界面遵循 ColorOS 的圆润节奏，但保持原生 Android 的轻巧与直接。
 
 > [!IMPORTANT]
-> 当前版本 `0.2.0` 优先验证 **OPPO CPH2797 / Android 16 / API 36** 和 **Pixel 10**。它需要成为系统默认短信应用才能完整读取、接收和保存短信；MMS 完整收发尚未实现。
+> 当前版本 `0.3.0` 优先验证 **OPPO CPH2797 / Android 16 / API 36** 和 **Pixel 10**。它需要成为系统默认短信应用才能完整读取、接收、发送和保存 SMS / MMS。
 
 ## 亮点
 
@@ -27,6 +27,8 @@
 |:--:|---|---|
 | ✨ | **本地验证码识别** | 保守解析验证码，列表内突出显示，点按即可复制；短信正文不上传 |
 | 💬 | **完整 SMS 对话流** | 会话列表、未读计数、搜索、单聊记录、新建短信与长短信发送 |
+| 🖼️ | **MMS 与群组消息** | 收发彩信、图片 / 音频 / 视频附件、群组收件人与附件预览 |
+| ✓ | **发送状态可追踪** | 展示正在发送、已发送、已送达与发送失败，并聚合长短信分片状态 |
 | 📶 | **双卡友好** | 展示 SIM 标识，发送前选择号码，适合双卡 ColorOS 设备 |
 | 🗑️ | **可恢复回收站** | 支持逐条恢复或永久删除，并可设置 7 / 30 / 90 天或永久保留 |
 | 🎨 | **三套自适应图标** | 棱镜流光、流体省略号、经典消息三种风格，应用内即时切换 |
@@ -35,10 +37,10 @@
 
 ### 当前能力边界
 
-- 已实现：默认短信角色申请、SMS 接收与发送、系统短信库读写、会话搜索、联系人选择、验证码识别、回收站、通知与 `sms:` / `smsto:` 链接入口。
-- 部分实现：已声明默认短信应用所需的 MMS 组件与入口，但收到 MMS 时只会提示暂不支持。
-- 已实现：可选云同步客户端，包含密码/一次性注册码连接、二维码扫描、设备路由、端到端加密、离线待发队列、实时长轮询和定时兜底拉取。
-- GitHub Releases 提供可安装的 debug-signed 测试版 APK；尚未提供可复现的正式签名发行版、完整 MMS 收发，以及面向其他机型的兼容性保证。实时同步使用自建服务器，不依赖 FCM。
+- 已实现：默认短信角色申请、SMS / MMS 收发、系统消息库读写、群组收件人、媒体附件、会话搜索、联系人选择、验证码识别、通知与 `sms:` / `smsto:` 链接入口。
+- 已实现：SMS 的正在发送、已发送、已送达与失败状态；长短信会聚合全部分片的回执后更新状态。
+- 已实现：可选云同步客户端，包含密码/一次性注册码连接、二维码扫描、设备路由、端到端加密、离线待发队列、实时长轮询和定时兜底拉取。当前云同步只覆盖 SMS 文本，不同步 MMS 或附件。
+- 当前限制：SMS 删除可进入回收站；MMS 及附件删除为永久操作。MMS 已完成系统 API 接入与真机界面冒烟测试，但仍需不同运营商的实际收发验证。GitHub Releases 提供 debug-signed 测试版 APK；尚未提供可复现的正式签名发行版或面向其他机型的兼容性保证。
 
 ## 产品原则
 
@@ -46,7 +48,7 @@
 - **本地优先：** 验证码解析、会话搜索和回收站状态全部留在设备上。
 - **能力诚实：** README 只描述仓库中已经实现并可验证的能力，不用未来设想代替实现。
 - **设备明确：** 当前只承诺 OPPO CPH2797 / Android 16 / API 36，不泛化兼容性结论。
-- **误操作可恢复：** 删除先进入回收站，真正清除前保留恢复路径。
+- **误操作可恢复：** SMS 删除先进入回收站；无法恢复的 MMS 删除会在操作前明确提示。
 
 ## 开始构建
 
@@ -98,7 +100,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | 权限 | 用途 |
 |---|---|
 | `READ_SMS` / `RECEIVE_SMS` / `SEND_SMS` | 展示、接收与发送普通短信 |
-| `RECEIVE_MMS` / `RECEIVE_WAP_PUSH` | 满足默认短信应用组件要求；完整 MMS 尚未实现 |
+| `RECEIVE_MMS` / `RECEIVE_WAP_PUSH` | 接收 MMS 通知并通过系统 `SmsManager` 下载彩信内容与附件 |
 | `READ_PHONE_STATE` / `READ_PHONE_NUMBERS` | 识别 SIM 与发送号码 |
 | `READ_CONTACTS` | 从通讯录选择收件人并显示联系人名称 |
 | `POST_NOTIFICATIONS` | 显示新短信通知 |
@@ -117,8 +119,12 @@ app/src/main/java/io/github/venompool888/capsulesms/
 └── sms/
     ├── OtpParser.java             # 本地、保守的验证码解析器
     ├── SmsRepository.java         # 系统短信库查询与写入
-    ├── SmsSender.java             # 单条 / 长短信与双卡发送
+    ├── SmsSender.java             # 单条 / 长短信、双卡发送与状态回执
+    ├── SmsStatusReceiver.java     # 已发送 / 已送达分片回执聚合
     ├── SmsDeliverReceiver.java    # 默认短信应用接收入口
+    ├── MmsSender.java             # 系统 MMS 发送与附件封装
+    ├── MmsDeliverReceiver.java    # MMS 通知与系统下载入口
+    ├── MmsDownloadReceiver.java   # 下载结果持久化与失败重试
     └── TrashStore.java            # 可恢复回收站
 └── sync/
     ├── CloudSyncActivity.java     # 连接、设备与路由设置
@@ -127,7 +133,7 @@ app/src/main/java/io/github/venompool888/capsulesms/
     └── CloudCrypto.java           # Keystore ECDH + AES-GCM 信封
 ```
 
-项目刻意保持小而透明：主应用使用 Android 原生 API，当前没有运行时第三方依赖。
+项目刻意保持小而透明。SMS / MMS 传输使用 Android 系统 API；MMS PDU 的解析和封装使用 `android-smsmms` 中基于 AOSP 的实现，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 ## 路线图
 
@@ -136,7 +142,9 @@ app/src/main/java/io/github/venompool888/capsulesms/
 - [x] 双卡发送、搜索、未读状态与回收站
 - [x] 自适应 / 单色图标与应用内切换
 - [x] 可选自建服务器与端到端短信同步
-- [ ] 完整 MMS 收发与附件预览
+- [x] MMS 收发、群组收件人与附件预览
+- [x] SMS 发送 / 送达 / 失败状态
+- [ ] 跨运营商 MMS 实机兼容性矩阵
 - [ ] 更完整的设备兼容性矩阵
 - [x] GitHub Releases 测试版 APK
 - [ ] 可复现的正式签名发行版
