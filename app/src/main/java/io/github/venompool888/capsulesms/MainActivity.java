@@ -37,6 +37,7 @@ import android.text.style.ClickableSpan;
 import android.text.style.ReplacementSpan;
 import android.text.format.DateUtils;
 import android.text.format.DateFormat;
+import android.util.Log;
 import android.util.Patterns;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -101,6 +102,8 @@ public final class MainActivity extends Activity {
     private static final float MESSAGE_MAX_WIDTH_FRACTION = 0.82f;
     private static final String ACTION_MANUAL_VERIFICATION =
             "io.github.venompool888.capsulesms.MANUAL_VERIFICATION";
+    private static final int MESSAGE_PAGE_SIZE = 40;
+    private static final int OLDER_MESSAGES_TRIGGER_DP = 240;
     private static final String SNAPSHOT_PREFS = "inbox_snapshot";
     private static final String SNAPSHOT_KEY = "conversations";
     private final ExecutorService io = Executors.newFixedThreadPool(2);
@@ -145,6 +148,11 @@ public final class MainActivity extends Activity {
     private LinearLayout conversationMessages;
     private ScrollView conversationScroll;
     private boolean messageSelectionMode;
+    private List<SmsModels.Message> loadedMessages = List.of();
+    private boolean hasOlderMessages;
+    private boolean loadingOlderMessages;
+    private boolean refreshAfterOlderMessages;
+    private View olderMessagesIndicator;
     private VerificationAnnotationStore verificationAnnotations;
     private int hiddenSettingsTapCount;
     private long hiddenSettingsLastTapAt;
@@ -1019,6 +1027,12 @@ public final class MainActivity extends Activity {
         Object item = inboxList.getAdapter().getItem(position);
         View firstVisible = inboxList.getChildAt(0);
         if (!(item instanceof SmsModels.Conversation) || firstVisible == null) return;
+        if (position == 0 && firstVisible.getTop() >= inboxList.getPaddingTop()) {
+            // At the very top: stay there so newly arrived conversations remain visible
+            // instead of pinning the old first row and pushing new rows off-screen.
+            inboxScrollAnchorAddress = null;
+            return;
+        }
         inboxScrollAnchorAddress = ((SmsModels.Conversation) item).address();
         inboxScrollAnchorOffset = firstVisible.getTop() - inboxList.getPaddingTop();
     }
@@ -1041,16 +1055,26 @@ public final class MainActivity extends Activity {
             SmsModels.Conversation conversation = conversations.get(i);
             String key = cacheKey(conversation.threadId(), conversation.address());
             if (messageCache.containsKey(key)) continue;
-            io.execute(() -> messageCache.put(key,
+            io.execute(() -> messageCache.putIfAbsent(key,
                     new SmsRepository(this).recentMessages(
-                            conversation.threadId(), conversation.address(), 40)));
+                            conversation.threadId(), conversation.address(), MESSAGE_PAGE_SIZE)));
         }
     }
 
     private void renderMessages(
             LinearLayout container, ScrollView scroll, List<SmsModels.Message> values) {
+        renderMessages(container, scroll, values, true);
+    }
+
+    private void renderMessages(LinearLayout container, ScrollView scroll,
+            List<SmsModels.Message> values, boolean scrollToBottom) {
+        loadedMessages = values;
+        // A full page means the provider probably holds more history above it.
+        hasOlderMessages = values.size() >= MESSAGE_PAGE_SIZE;
+        int previousScrollY = scroll.getScrollY();
         container.removeAllViews();
-        int animatedFrom = Math.max(0, values.size() - 10);
+        messageRows.clear();
+        int animatedFrom = scrollToBottom ? Math.max(0, values.size() - 10) : values.size();
         for (int i = 0; i < values.size(); i++) {
             SmsModels.Message message = values.get(i);
             View bubble = messageBubble(message);
@@ -1058,7 +1082,90 @@ public final class MainActivity extends Activity {
             if (i >= animatedFrom) animateMessageBubble(
                     bubble, message.isOutgoing(), (i - animatedFrom) * 18L);
         }
-        scroll.post(this::scrollConversationToBottom);
+        if (messageSelectionMode) refreshMessageSelectionUi();
+        if (scrollToBottom) scroll.post(() -> {
+            if (scroll == conversationScroll) scrollConversationToBottom();
+        });
+        else scroll.post(() -> scroll.scrollTo(0, previousScrollY));
+    }
+
+    private boolean isConversationNearBottom() {
+        ScrollView scroll = conversationScroll;
+        if (scroll == null || scroll.getChildCount() == 0) return true;
+        int bottom = scroll.getChildAt(0).getHeight() - scroll.getHeight();
+        return scroll.getScrollY() >= bottom - dp(OLDER_MESSAGES_TRIGGER_DP);
+    }
+
+    private void loadOlderMessages() {
+        if (!hasOlderMessages || loadingOlderMessages || loadedMessages.isEmpty()) return;
+        LinearLayout container = conversationMessages;
+        ScrollView scroll = conversationScroll;
+        String address = currentAddress;
+        long threadId = currentThreadId;
+        if (container == null || scroll == null || address == null || address.isBlank()) return;
+        SmsModels.Message oldest = loadedMessages.get(0);
+        loadingOlderMessages = true;
+        TextView indicator = text("正在加载更早的消息…", 13, palette.textMuted);
+        indicator.setGravity(Gravity.CENTER);
+        indicator.setPadding(0, dp(6), 0, dp(10));
+        olderMessagesIndicator = indicator;
+        container.addView(indicator, 0);
+        io.execute(() -> {
+            try {
+                List<SmsModels.Message> page = new SmsRepository(this)
+                        .messagesBefore(threadId, address, oldest, MESSAGE_PAGE_SIZE);
+                runOnUiThread(() -> finishOlderMessages(indicator, page));
+            } catch (RuntimeException error) {
+                Log.w("CapsuleSMS", "Could not load the older message page", error);
+                runOnUiThread(() -> finishOlderMessages(indicator, null));
+            }
+        });
+    }
+
+    private void finishOlderMessages(View indicator, List<SmsModels.Message> page) {
+        if (indicator != olderMessagesIndicator || currentAddress == null || isDestroyed()) return;
+        LinearLayout container = conversationMessages;
+        View anchor = container.getChildAt(1);
+        int anchorOffset = anchor.getTop() - conversationScroll.getScrollY();
+        container.removeView(indicator);
+        olderMessagesIndicator = null;
+        loadingOlderMessages = false;
+        if (page == null) {
+            Toast.makeText(this, "无法加载更早的消息", Toast.LENGTH_SHORT).show();
+        } else {
+            hasOlderMessages = page.size() == MESSAGE_PAGE_SIZE;
+            if (!page.isEmpty()) prependMessages(page);
+        }
+        restoreMessageAnchor(anchor, anchorOffset);
+        if (refreshAfterOlderMessages) {
+            refreshAfterOlderMessages = false;
+            refreshInboxFromProvider();
+        }
+    }
+
+    private void prependMessages(List<SmsModels.Message> page) {
+        for (int i = 0; i < page.size(); i++) {
+            conversationMessages.addView(messageBubble(page.get(i)), i);
+        }
+        List<SmsModels.Message> merged = new ArrayList<>(page);
+        merged.addAll(loadedMessages);
+        loadedMessages = merged;
+        messageCache.put(cacheKey(currentThreadId, currentAddress), merged);
+        if (messageSelectionMode) refreshMessageSelectionUi();
+    }
+
+    private void restoreMessageAnchor(View anchor, int offset) {
+        ScrollView scroll = conversationScroll;
+        LinearLayout container = conversationMessages;
+        container.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override public void onLayoutChange(View view, int left, int top, int right,
+                    int bottom, int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                view.removeOnLayoutChangeListener(this);
+                if (scroll == conversationScroll && anchor.getParent() == container) {
+                    scroll.scrollTo(0, anchor.getTop() - offset);
+                }
+            }
+        });
     }
 
     private void showConversation(String address) {
@@ -1070,6 +1177,11 @@ public final class MainActivity extends Activity {
         showingTrash = false;
         selectedMessageIds.clear();
         messageRows.clear();
+        loadedMessages = List.of();
+        hasOlderMessages = false;
+        loadingOlderMessages = false;
+        refreshAfterOlderMessages = false;
+        olderMessagesIndicator = null;
         if (currentThreadId <= 0) {
             currentThreadId = new SmsRepository(this).findThreadId(address);
         }
@@ -1110,6 +1222,10 @@ public final class MainActivity extends Activity {
                 .withEndAction(() -> scrollbarThumb.setVisibility(View.INVISIBLE))
                 .start();
         scroll.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
+            if (scroll == conversationScroll && scrollY < oldScrollY
+                    && scrollY < dp(OLDER_MESSAGES_TRIGGER_DP)) {
+                loadOlderMessages();
+            }
             scrollbarThumb.removeCallbacks(fadeScrollbar);
             scrollbarThumb.animate().cancel();
             if (!updateConversationScrollbar(scrollbarThumb, scroll)) return;
@@ -1126,17 +1242,20 @@ public final class MainActivity extends Activity {
         addComposer(null);
         animateScreenIn(1);
 
-        String conversationCacheKey = cacheKey(currentThreadId, address);
+        long threadId = currentThreadId;
+        String conversationCacheKey = cacheKey(threadId, address);
         List<SmsModels.Message> cachedMessages = messageCache.get(conversationCacheKey);
         if (cachedMessages != null) renderMessages(messages, scroll, cachedMessages);
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
-            repository.markRead(currentThreadId, address);
+            repository.markRead(threadId, address);
             if (cachedMessages != null) return;
-            List<SmsModels.Message> values = repository.recentMessages(currentThreadId, address, 40);
-            messageCache.put(conversationCacheKey, values);
+            List<SmsModels.Message> values = repository.recentMessages(threadId, address, MESSAGE_PAGE_SIZE);
             runOnUiThread(() -> {
-                if (address.equals(currentAddress)) renderMessages(messages, scroll, values);
+                if (messages != conversationMessages || !address.equals(currentAddress)
+                        || !loadedMessages.isEmpty()) return;
+                messageCache.put(conversationCacheKey, values);
+                renderMessages(messages, scroll, values);
             });
         });
     }
@@ -1759,7 +1878,7 @@ public final class MainActivity extends Activity {
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
             int moved = repository.moveToTrash(this, ids) + repository.deleteSelectedMms(ids);
-            List<SmsModels.Message> remaining = repository.recentMessages(threadId, address, 40);
+            List<SmsModels.Message> remaining = repository.recentMessages(threadId, address, MESSAGE_PAGE_SIZE);
             messageCache.put(cacheKey(threadId, address), remaining);
             inboxConversations = null;
             cachedInboxViews.clear();
@@ -2030,13 +2149,16 @@ public final class MainActivity extends Activity {
         int generation = ++providerRefreshGeneration;
         String openAddress = currentAddress;
         long openThreadId = currentThreadId;
+        int openLoadedCount = loadedMessages.size();
+        int openMessageLimit = Math.max(MESSAGE_PAGE_SIZE, openLoadedCount + 1);
+        LinearLayout openContainer = conversationMessages;
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
             List<SmsModels.Conversation> conversations = repository.conversations();
             List<SmsModels.Message> openMessages = null;
             if (openAddress != null && !openAddress.isBlank()) {
                 repository.markRead(openThreadId, openAddress);
-                openMessages = repository.recentMessages(openThreadId, openAddress, 40);
+                openMessages = repository.recentMessages(openThreadId, openAddress, openMessageLimit);
             }
             saveInboxSnapshot(conversations);
             List<SmsModels.Message> refreshedOpenMessages = openMessages;
@@ -2046,9 +2168,20 @@ public final class MainActivity extends Activity {
                 inboxConversations = conversations;
                 cachedInboxViews.clear();
                 if (refreshedOpenMessages != null && openAddress.equals(currentAddress)
+                        && openThreadId == currentThreadId && openContainer == conversationMessages
                         && conversationMessages != null && conversationScroll != null) {
+                    if (loadingOlderMessages) {
+                        refreshAfterOlderMessages = true;
+                        return;
+                    }
+                    if (loadedMessages.size() > openMessageLimit) {
+                        refreshInboxFromProvider();
+                        return;
+                    }
                     messageCache.put(cacheKey(openThreadId, openAddress), refreshedOpenMessages);
-                    renderMessages(conversationMessages, conversationScroll, refreshedOpenMessages);
+                    renderMessages(conversationMessages, conversationScroll, refreshedOpenMessages,
+                            isConversationNearBottom());
+                    hasOlderMessages = refreshedOpenMessages.size() == openMessageLimit;
                     return;
                 }
                 if (changed && currentAddress == null && inboxFrame != null) {
