@@ -91,6 +91,7 @@ final class CloudCrypto {
                 Cipher.DECRYPT_MODE, wrappingKey, decode(wrapped.getString("iv")),
                 (eventId + "\n" + currentDeviceId).getBytes(StandardCharsets.UTF_8),
                 decode(wrapped.getString("ciphertext")));
+        if (contentKeyBytes.length != 32) throw new IllegalArgumentException("内容密钥长度无效");
         SecretKey contentKey = new SecretKeySpec(contentKeyBytes, "AES");
         byte[] plaintext = aesGcm(
                 Cipher.DECRYPT_MODE, contentKey, decode(envelope.getString("payloadIv")),

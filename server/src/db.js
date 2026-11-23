@@ -148,12 +148,15 @@ export function consumeEnrollment(db, code) {
 }
 
 export function replaceRoutes(db, userId, deviceId, pushTo, receiveFrom) {
-  const allowed = new Set(db.prepare(
-    "SELECT id FROM devices WHERE user_id = ? AND enabled = 1",
-  ).all(userId).map((row) => row.id));
+  const devices = db.prepare(
+    "SELECT id, platform FROM devices WHERE user_id = ? AND enabled = 1",
+  ).all(userId);
+  const allowed = new Set(devices.map(({ id }) => id));
+  const sources = new Set(devices.filter(({ platform }) => platform !== "fluidcapsule-android")
+    .map(({ id }) => id));
   if (!allowed.has(deviceId)) throw new Error("设备不存在或已停用");
-  const outgoing = uniqueDeviceIds(pushTo, allowed, deviceId);
-  const incoming = uniqueDeviceIds(receiveFrom, allowed, deviceId);
+  const outgoing = sources.has(deviceId) ? uniqueDeviceIds(pushTo, allowed, deviceId) : [];
+  const incoming = uniqueDeviceIds(receiveFrom, sources, deviceId);
   const now = Date.now();
   db.exec("BEGIN IMMEDIATE");
   try {

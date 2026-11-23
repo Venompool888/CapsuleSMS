@@ -53,6 +53,10 @@ public final class CloudSyncEngine {
             this.publicKey = publicKey;
             this.lastSeenAt = lastSeenAt;
         }
+
+        boolean isReceiveOnly() {
+            return "fluidcapsule-android".equals(platform);
+        }
     }
 
     public static final class DeviceState {
@@ -101,6 +105,23 @@ public final class CloudSyncEngine {
     public static DeviceState getDeviceState(Context context) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
         return parseState(CloudSyncApi.get(config, "/api/v1/devices"));
+    }
+
+    static DeviceState updateRoute(Context context, String deviceId, boolean push, boolean enabled)
+            throws Exception {
+        DeviceState current = getDeviceState(context);
+        Device peer = current.devices.stream().filter(device -> device.id.equals(deviceId))
+                .findFirst().orElseThrow(() -> new IllegalStateException("设备已不在当前账号中"));
+        Set<String> routes = push ? current.pushTo : current.receiveFrom;
+        if (enabled) {
+            if (!push && peer.isReceiveOnly()) throw new IllegalArgumentException("流体胶囊只接收短信");
+            routes.add(deviceId);
+        } else {
+            routes.remove(deviceId);
+        }
+        current.devices.stream().filter(Device::isReceiveOnly)
+                .forEach(device -> current.receiveFrom.remove(device.id));
+        return saveRoutes(context, current.pushTo, current.receiveFrom);
     }
 
     public static DeviceState saveRoutes(
@@ -269,6 +290,7 @@ public final class CloudSyncEngine {
             }
         }
         if (target == null) throw new IllegalStateException("来源设备已不在当前账号中");
+        if (target.isReceiveOnly()) throw new IllegalStateException("流体胶囊不能代发短信");
         String eventId = config.deviceId() + ":reply:" + UUID.randomUUID();
         JSONObject payload = new JSONObject()
                 .put("kind", "send_sms")
@@ -401,7 +423,11 @@ public final class CloudSyncEngine {
     }
 
     private static void acknowledge(CloudSyncConfig config, long deliveryId) throws Exception {
-        CloudSyncApi.post(config, "/api/v1/messages/" + deliveryId + "/ack", new JSONObject());
+        try {
+            CloudSyncApi.post(config, "/api/v1/messages/" + deliveryId + "/ack", new JSONObject());
+        } catch (CloudSyncApi.ApiException error) {
+            if (error.status != 404) throw error;
+        }
     }
 
     private static DeviceState parseState(JSONObject json) throws Exception {
@@ -453,7 +479,9 @@ public final class CloudSyncEngine {
         JSONArray values = new JSONArray();
         for (String value : processed) values.put(value);
         SharedPreferences prefs = context.getSharedPreferences(PROCESSED_PREFS, Context.MODE_PRIVATE);
-        prefs.edit().putString(PROCESSED_KEY, values.toString()).apply();
+        if (!prefs.edit().putString(PROCESSED_KEY, values.toString()).commit()) {
+            throw new IllegalStateException("无法保存同步去重记录");
+        }
     }
 
     private CloudSyncEngine() {}
