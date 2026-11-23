@@ -61,6 +61,10 @@ const server = app.listen(port, "127.0.0.1", (error) => {
   console.info(`Dev sync server on ${serverUrl}`);
   console.info(`Test account credentials: ${credentialsPath}`);
 });
-const shutdown = () => server.close(() => { db.close(); process.exit(0); });
+const shutdown = () => {
+  server.close(() => { db.close(); process.exit(0); });
+  // Long-poll clients keep connections open; drop them so shutdown actually completes.
+  server.closeAllConnections();
+};
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

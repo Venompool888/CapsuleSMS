@@ -32,6 +32,12 @@ public final class CloudSyncConfig {
     public String deviceId() { return prefs.getString("device_id", ""); }
     public String account() { return prefs.getString("account", ""); }
 
+    String lastError() { return prefs.getString("last_error", ""); }
+
+    void recordError(String message) {
+        prefs.edit().putString("last_error", message).apply();
+    }
+
     public String token() {
         String encoded = prefs.getString("token_ciphertext", "");
         String iv = prefs.getString("token_iv", "");

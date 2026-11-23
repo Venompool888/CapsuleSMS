@@ -12,6 +12,8 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 final class CloudSyncApi {
+    private static final int MAX_ENVELOPE_BYTES = 64 * 1024;
+
     static String normalizeServer(String raw) {
         String value = raw == null ? "" : raw.trim();
         while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
@@ -38,6 +40,24 @@ final class CloudSyncApi {
 
     static JSONObject post(CloudSyncConfig config, String path, JSONObject body) throws Exception {
         return request(config.server(), config.token(), "POST", path, body);
+    }
+
+    static JSONObject postMessage(CloudSyncConfig config, JSONObject body) throws Exception {
+        checkEnvelopeSize(body.getJSONObject("envelope").toString());
+        try {
+            return post(config, "/api/v1/messages", body);
+        } catch (ApiException error) {
+            if (!error.isInvalidEnvelope()) throw error;
+            throw new RejectedEnvelopeException("服务器拒绝了加密信封（为空或超过 64 KiB）", error);
+        }
+    }
+
+    static void checkEnvelopeSize(String serializedEnvelope) throws RejectedEnvelopeException {
+        // The server measures its reserialized JSON, where Base64 slashes are not escaped.
+        int bytes = serializedEnvelope.replace("\\/", "/").getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > MAX_ENVELOPE_BYTES) {
+            throw new RejectedEnvelopeException("加密信封超过 64 KiB（" + bytes + " 字节）", null);
+        }
     }
 
     static JSONObject put(CloudSyncConfig config, String path, JSONObject body) throws Exception {
@@ -85,7 +105,7 @@ final class CloudSyncApi {
         JSONObject json = response.isBlank() ? new JSONObject() : new JSONObject(response);
         if (status < 200 || status >= 300) {
             String message = json.optString("message", "服务器返回 " + status);
-            throw new ApiException(status, message);
+            throw new ApiException(status, json.optString("error"), message);
         }
         return json;
     }
@@ -103,9 +123,22 @@ final class CloudSyncApi {
 
     static final class ApiException extends Exception {
         final int status;
-        ApiException(int status, String message) {
+        private final String code;
+
+        ApiException(int status, String code, String message) {
             super(message);
             this.status = status;
+            this.code = code;
+        }
+
+        boolean isInvalidEnvelope() {
+            return status == 413 && "invalid_envelope".equals(code);
+        }
+    }
+
+    static final class RejectedEnvelopeException extends Exception {
+        RejectedEnvelopeException(String message, ApiException cause) {
+            super(message, cause);
         }
     }
 

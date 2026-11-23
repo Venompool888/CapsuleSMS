@@ -16,6 +16,7 @@ import io.github.venompool888.capsulesms.sms.CloudMessageOriginStore;
 import io.github.venompool888.capsulesms.sms.SmsRepository;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
@@ -29,6 +30,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public final class CloudSyncEngine {
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
@@ -177,12 +179,16 @@ public final class CloudSyncEngine {
         int uploaded = 0;
         for (JSONObject event : CloudSyncOutbox.all(context)) {
             String eventId = event.getString("eventId");
-            uploadEvent(
-                    context, config, eventId, event.getString("address"),
-                    event.getString("body"), event.getLong("timestamp"),
-                    event.optInt("subscriptionId", -1), event.getInt("type"));
+            try {
+                uploadEvent(
+                        context, config, eventId, event.getString("address"),
+                        event.getString("body"), event.getLong("timestamp"),
+                        event.optInt("subscriptionId", -1), event.getInt("type"));
+                uploaded++;
+            } catch (CloudSyncApi.RejectedEnvelopeException error) {
+                config.recordError("同步短信已跳过：" + error.getMessage());
+            }
             CloudSyncOutbox.remove(context, eventId);
-            uploaded++;
         }
         return uploaded;
     }
@@ -207,7 +213,7 @@ public final class CloudSyncEngine {
         if (line.number != null) payload.put("lineNumber", line.number);
         if (line.simSlot > 0) payload.put("simSlot", line.simSlot);
         JSONObject envelope = CloudCrypto.encrypt(eventId, payload, targets);
-        JSONObject response = CloudSyncApi.post(config, "/api/v1/messages",
+        JSONObject response = CloudSyncApi.postMessage(config,
                 new JSONObject().put("eventId", eventId).put("envelope", envelope));
         return response.optJSONArray("acceptedTargets") == null
                 ? 0 : response.getJSONArray("acceptedTargets").length();
@@ -231,19 +237,51 @@ public final class CloudSyncEngine {
                 acknowledge(config, deliveryId);
                 continue;
             }
-            Device source = devices.get(message.getString("sourceDeviceId"));
-            if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
-                throw new SecurityException("找不到发送设备的公钥");
+            if (completeDelivery(
+                    () -> applyDelivery(context, state.currentDeviceId, devices, message),
+                    reason -> config.recordError("跳过同步消息 #" + deliveryId + "：" + reason),
+                    () -> {
+                        rememberProcessed(context, processed, eventId);
+                        acknowledge(config, deliveryId);
+                    })) {
+                inserted++;
             }
-            JSONObject payload = CloudCrypto.decrypt(
-                    eventId, state.currentDeviceId, source.publicKey,
-                    message.getJSONObject("envelope"));
-            processPayload(context, payload, source);
-            rememberProcessed(context, processed, eventId);
-            acknowledge(config, deliveryId);
-            inserted++;
         }
         return inserted;
+    }
+
+    @FunctionalInterface
+    interface DeliveryAction {
+        void run() throws Exception;
+    }
+
+    static boolean completeDelivery(
+            DeliveryAction apply, Consumer<String> recordError, DeliveryAction markProcessedAndAck)
+            throws Exception {
+        boolean applied = false;
+        try {
+            apply.run();
+            applied = true;
+        } catch (CloudCrypto.InvalidEnvelopeException | InvalidPayloadException error) {
+            recordError.accept(error.getMessage());
+        } catch (JSONException error) {
+            recordError.accept("信封或短信格式无效");
+        }
+        markProcessedAndAck.run();
+        return applied;
+    }
+
+    private static void applyDelivery(
+            Context context, String currentDeviceId, Map<String, Device> devices, JSONObject message)
+            throws Exception {
+        Device source = devices.get(message.getString("sourceDeviceId"));
+        if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
+            throw new CloudCrypto.InvalidEnvelopeException("找不到发送设备的公钥");
+        }
+        JSONObject payload = CloudCrypto.decrypt(
+                message.getString("eventId"), currentDeviceId, source.publicKey,
+                message.getJSONObject("envelope"));
+        processPayload(context, payload, source);
     }
 
     public static void syncAsync(Context context, ResultCallback<Integer> callback) {
@@ -299,7 +337,7 @@ public final class CloudSyncEngine {
                 .put("subscriptionId", route.subscriptionId)
                 .put("requestedAt", System.currentTimeMillis());
         JSONObject envelope = CloudCrypto.encrypt(eventId, payload, List.of(target));
-        JSONObject response = CloudSyncApi.post(config, "/api/v1/messages", new JSONObject()
+        JSONObject response = CloudSyncApi.postMessage(config, new JSONObject()
                 .put("eventId", eventId)
                 .put("targetDeviceId", target.id)
                 .put("envelope", envelope));
@@ -323,16 +361,20 @@ public final class CloudSyncEngine {
             executeRemoteSend(context, payload);
             return;
         }
-        throw new IllegalArgumentException("不支持的同步消息类型");
+        throw new InvalidPayloadException("不支持的同步消息类型");
     }
 
-    private static void executeRemoteSend(Context context, JSONObject payload) {
+    private static void executeRemoteSend(Context context, JSONObject payload)
+            throws InvalidPayloadException {
         String address = payload.optString("address", "").trim();
         String body = payload.optString("body", "");
         int subscriptionId = payload.optInt("subscriptionId", -1);
         if (address.isBlank() || address.length() > 512 || body.isBlank()
-                || body.length() > 60_000 || !isActiveSubscription(context, subscriptionId)) {
-            throw new IllegalArgumentException("远端发送指令的收件人、内容或 SIM 已失效");
+                || body.length() > 60_000 || subscriptionId < 0) {
+            throw new InvalidPayloadException("远端发送指令的收件人、内容或 SIM 无效");
+        }
+        if (!isActiveSubscription(context, subscriptionId)) {
+            throw new IllegalStateException("远端发送指令的 SIM 不可用");
         }
         boolean dispatched = io.github.venompool888.capsulesms.sms.SmsSender.send(
                 context, address, body, subscriptionId, (success, result) -> {});
@@ -351,7 +393,7 @@ public final class CloudSyncEngine {
         if (address.isBlank() || address.length() > 512 || body.length() > 60_000
                 || (type != Telephony.Sms.MESSAGE_TYPE_INBOX
                 && type != Telephony.Sms.MESSAGE_TYPE_SENT)) {
-            throw new IllegalArgumentException("同步短信内容无效");
+            throw new InvalidPayloadException("同步短信内容无效");
         }
         long existingId = SmsRepository.findMessageId(context, address, body, timestamp, type);
         if (existingId >= 0) {
@@ -419,6 +461,12 @@ public final class CloudSyncEngine {
         LineIdentity(String number, int simSlot) {
             this.number = number == null || number.isBlank() ? null : number.trim();
             this.simSlot = simSlot;
+        }
+    }
+
+    private static final class InvalidPayloadException extends Exception {
+        InvalidPayloadException(String message) {
+            super(message);
         }
     }
 

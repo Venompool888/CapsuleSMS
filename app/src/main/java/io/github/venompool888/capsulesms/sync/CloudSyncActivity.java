@@ -580,10 +580,12 @@ public final class CloudSyncActivity extends Activity {
         int color;
         String label;
         String hint;
-        if (lastError != null) {
+        String syncError = new CloudSyncConfig(this).lastError();
+        boolean hasError = lastError != null || !syncError.isBlank();
+        if (hasError) {
             color = palette.danger;
-            label = errorMessage(lastError);
-            hint = "可点“刷新设备”重试。";
+            label = lastError != null ? errorMessage(lastError) : syncError;
+            hint = lastError != null ? "可点“刷新设备”重试。" : "";
         } else if (pushTo.isEmpty() && receiveFrom.isEmpty()) {
             color = warningColor();
             label = "未设置同步设备";
@@ -595,7 +597,7 @@ public final class CloudSyncActivity extends Activity {
         }
         statusDot.setBackground(dotDrawable(color));
         statusText.setText(label);
-        statusText.setTextColor(lastError != null ? palette.danger : palette.textPrimary);
+        statusText.setTextColor(hasError ? palette.danger : palette.textPrimary);
         statusHint.setText(hint);
     }
 

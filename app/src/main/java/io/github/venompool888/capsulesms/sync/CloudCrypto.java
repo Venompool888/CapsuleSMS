@@ -7,6 +7,8 @@ import android.util.Base64;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -16,10 +18,13 @@ import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.spec.ECGenParameterSpec;
+import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.List;
 
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.KeyAgreement;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -78,33 +83,53 @@ final class CloudCrypto {
             JSONObject envelope) throws Exception {
         if (envelope.optInt("version") != 1
                 || !"ECDH-P256+A256GCM".equals(envelope.optString("algorithm"))) {
-            throw new IllegalArgumentException("不支持的加密信封");
+            throw new InvalidEnvelopeException("不支持的加密信封");
         }
         String senderKey = envelope.getString("senderPublicKey");
         if (!constantTimeEquals(senderKey, registeredSourceKey)) {
-            throw new SecurityException("发送设备公钥与服务器记录不一致");
+            throw new InvalidEnvelopeException("发送设备公钥与服务器记录不一致");
         }
         JSONObject wrapped = envelope.getJSONObject("wrappedKeys").getJSONObject(currentDeviceId);
-        SecretKey wrappingKey = deriveWrappingKey(
-                keyPair().getPrivate(), decodePublicKey(senderKey), eventId, currentDeviceId);
-        byte[] contentKeyBytes = aesGcm(
-                Cipher.DECRYPT_MODE, wrappingKey, decode(wrapped.getString("iv")),
-                (eventId + "\n" + currentDeviceId).getBytes(StandardCharsets.UTF_8),
-                decode(wrapped.getString("ciphertext")));
-        if (contentKeyBytes.length != 32) throw new IllegalArgumentException("内容密钥长度无效");
-        SecretKey contentKey = new SecretKeySpec(contentKeyBytes, "AES");
-        byte[] plaintext = aesGcm(
-                Cipher.DECRYPT_MODE, contentKey, decode(envelope.getString("payloadIv")),
-                eventId.getBytes(StandardCharsets.UTF_8),
-                decode(envelope.getString("ciphertext")));
-        return new JSONObject(new String(plaintext, StandardCharsets.UTF_8));
+        PrivateKey ownPrivate = keyPair().getPrivate();
+        try {
+            SecretKey wrappingKey = deriveWrappingKey(
+                    ownPrivate, decodePublicKey(senderKey), eventId, currentDeviceId);
+            byte[] contentKeyBytes = aesGcm(
+                    Cipher.DECRYPT_MODE, wrappingKey, decode(wrapped.getString("iv")),
+                    (eventId + "\n" + currentDeviceId).getBytes(StandardCharsets.UTF_8),
+                    decode(wrapped.getString("ciphertext")));
+            if (contentKeyBytes.length != 32) throw new InvalidEnvelopeException("内容密钥长度无效");
+            SecretKey contentKey = new SecretKeySpec(contentKeyBytes, "AES");
+            byte[] plaintext = aesGcm(
+                    Cipher.DECRYPT_MODE, contentKey, decode(envelope.getString("payloadIv")),
+                    eventId.getBytes(StandardCharsets.UTF_8),
+                    decode(envelope.getString("ciphertext")));
+            return new JSONObject(new String(plaintext, StandardCharsets.UTF_8));
+        } catch (InvalidKeySpecException | InvalidAlgorithmParameterException
+                 | BadPaddingException | IllegalBlockSizeException | IllegalArgumentException error) {
+            throw new InvalidEnvelopeException("无法解密加密信封", error);
+        }
+    }
+
+    static final class InvalidEnvelopeException extends Exception {
+        InvalidEnvelopeException(String message) {
+            super(message);
+        }
+
+        InvalidEnvelopeException(String message, Exception cause) {
+            super(message, cause);
+        }
     }
 
     private static SecretKey deriveWrappingKey(
             PrivateKey ownPrivate, PublicKey otherPublic, String eventId, String targetId) throws Exception {
         KeyAgreement agreement = KeyAgreement.getInstance("ECDH");
         agreement.init(ownPrivate);
-        agreement.doPhase(otherPublic, true);
+        try {
+            agreement.doPhase(otherPublic, true);
+        } catch (InvalidKeyException error) {
+            throw new InvalidKeySpecException("设备公钥无法用于密钥协商", error);
+        }
         byte[] shared = agreement.generateSecret();
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         digest.update("capsule-wrap-v1\n".getBytes(StandardCharsets.UTF_8));
