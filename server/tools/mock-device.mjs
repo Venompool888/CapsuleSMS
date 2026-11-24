@@ -9,6 +9,8 @@
 //   node tools/mock-device.mjs sms --from +61400000000 --body "Your code is 482913" [--type sent]
 //   node tools/mock-device.mjs remote-send --to <deviceId> --address +614... --body "hi" --sub 1
 //   node tools/mock-device.mjs listen        # print (and acknowledge) incoming messages
+//   node tools/mock-device.mjs bad-sms --kind tamper|wrong-sender|bad-json|unknown-kind|oversized
+//       # queue one message receivers must skip (oversized: expect the server to reject it)
 //
 // Options: --server <url> (default from data/dev/credentials.json), --state <name> (default
 // "mock") to run several mock devices side by side.
@@ -41,6 +43,7 @@ const { positionals, values: opts } = parseArgs({
     to: { type: "string" },
     address: { type: "string" },
     body: { type: "string" },
+    kind: { type: "string" },
     type: { type: "string", default: "inbox" },
     sub: { type: "string", default: "-1" },
     once: { type: "boolean", default: false },
@@ -81,10 +84,13 @@ function gcmDecrypt(key, iv, aad, data) {
 }
 
 export function encryptEnvelope(privateKey, eventId, payload, targets) {
+  return encryptPlaintext(privateKey, eventId, Buffer.from(JSON.stringify(payload), "utf8"), targets);
+}
+
+function encryptPlaintext(privateKey, eventId, plaintext, targets) {
   const contentKey = randomBytes(32);
   const payloadIv = randomBytes(12);
-  const ciphertext = gcmEncrypt(contentKey, payloadIv, eventId,
-    Buffer.from(JSON.stringify(payload), "utf8"));
+  const ciphertext = gcmEncrypt(contentKey, payloadIv, eventId, plaintext);
   const wrappedKeys = {};
   for (const target of targets) {
     if (!target.publicKey) throw new Error(`Device "${target.name}" has no public key`);
@@ -103,6 +109,39 @@ export function encryptEnvelope(privateKey, eventId, payload, targets) {
     ciphertext: ciphertext.toString("base64"),
     wrappedKeys,
   };
+}
+
+// Envelopes a receiver must record as an error, acknowledge and skip, without blocking later
+// messages. "oversized" is over the server's 64 KiB limit, so the server should reject it.
+export const BROKEN_KINDS = ["tamper", "wrong-sender", "bad-json", "unknown-kind", "oversized"];
+export const MAX_ENVELOPE_BYTES = 64 * 1024;
+
+export function brokenEnvelope(kind, privateKey, eventId, targets) {
+  const sms = { kind: "sms", address: "CloudSyncBad", body: `broken envelope test: ${kind}`,
+    timestamp: Date.now(), subscriptionId: -1, type: SMS_TYPE.inbox };
+  switch (kind) {
+    case "tamper": {
+      const envelope = encryptEnvelope(privateKey, eventId, sms, targets);
+      const ciphertext = Buffer.from(envelope.ciphertext, "base64");
+      ciphertext[0] ^= 0x01; // breaks the GCM tag check
+      return { ...envelope, ciphertext: ciphertext.toString("base64") };
+    }
+    case "wrong-sender": {
+      // Signed by a key the server never registered for this device.
+      const { privateKey: stranger } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+      return encryptEnvelope(stranger, eventId, sms, targets);
+    }
+    case "bad-json":
+      return encryptPlaintext(privateKey, eventId, Buffer.from("not json {", "utf8"), targets);
+    case "unknown-kind":
+      return encryptEnvelope(privateKey, eventId, { ...sms, kind: "bogus" }, targets);
+    case "oversized":
+      // Just over the limit once Base64-encoded, but under express's 96 KB body limit, so
+      // the server answers with its own 413 invalid_envelope instead of a parser error.
+      return encryptEnvelope(privateKey, eventId, { ...sms, body: "x".repeat(49_152) }, targets);
+    default:
+      throw new Error(`--kind must be one of: ${BROKEN_KINDS.join(", ")}`);
+  }
 }
 
 export function decryptEnvelope(privateKey, eventId, deviceId, registeredSourceKey, envelope) {
@@ -258,6 +297,27 @@ const commands = {
     console.log(`Queued for: ${names.join(", ") || "nobody"}`);
   },
 
+  async "bad-sms"() {
+    if (!BROKEN_KINDS.includes(opts.kind)) {
+      throw new Error(`bad-sms needs --kind ${BROKEN_KINDS.join("|")}`);
+    }
+    const state = loadState();
+    const info = await call(state, "GET", "/api/v1/devices");
+    const targets = info.devices.filter((d) => info.pushTo.includes(d.id));
+    if (!targets.length) throw new Error("This mock pushes to no device. Run: route --push all");
+    const eventId = `${state.deviceId}:${randomUUID()}`;
+    const envelope = brokenEnvelope(opts.kind, state.privateKey, eventId, targets);
+    try {
+      const response = await call(state, "POST", "/api/v1/messages", { eventId, envelope });
+      const names = response.acceptedTargets
+        .map((id) => info.devices.find((d) => d.id === id)?.name ?? id);
+      console.log(`Queued broken "${opts.kind}" message ${eventId} for: ${names.join(", ") || "nobody"}`);
+    } catch (error) {
+      if (opts.kind !== "oversized" || error.status !== 413) throw error;
+      console.log(`Server rejected the oversized envelope as expected (${error.message})`);
+    }
+  },
+
   async "remote-send"() {
     const subscriptionId = Number(opts.sub);
     if (!opts.to || !opts.address?.trim() || !opts.body?.trim()
@@ -314,7 +374,7 @@ if (isMain) {
   const requested = positionals[0];
   if (!Object.hasOwn(commands, requested)) {
     console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n")
-      .slice(1, 14).map((line) => line.replace(/^\/\/ ?/, "")).join("\n"));
+      .slice(1, 16).map((line) => line.replace(/^\/\/ ?/, "")).join("\n"));
     process.exitCode = requested ? 1 : 0;
   } else {
     await commands[requested]().catch((error) => {
