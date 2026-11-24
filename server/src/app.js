@@ -25,6 +25,7 @@ import {
 
 const COOKIE_NAME = "capsule_session";
 const MAX_ENVELOPE_BYTES = 64 * 1024;
+const RECEIVE_ONLY_PLATFORM = "fluidcapsule-android";
 
 export function createApp({ db, config }) {
   const app = express();
@@ -181,6 +182,11 @@ export function createApp({ db, config }) {
     res.json(deviceState(db, req.device));
   });
   app.post("/api/v1/messages", (req, res) => {
+    // FluidCapsule only displays SMS. Without this, a receive-only device could use the
+    // reverse direction of a phone→FluidCapsule route to make the phone send or store SMS.
+    if (req.device.platform === RECEIVE_ONLY_PLATFORM) {
+      return jsonError(res, 403, "receive_only_device", "此设备只能接收短信");
+    }
     const eventId = String(req.body.eventId ?? "");
     if (!/^[A-Za-z0-9._:-]{8,128}$/.test(eventId)) {
       return jsonError(res, 400, "invalid_event_id", "eventId 格式无效");

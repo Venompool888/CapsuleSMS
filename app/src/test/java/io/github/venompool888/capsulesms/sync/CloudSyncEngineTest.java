@@ -53,4 +53,24 @@ public final class CloudSyncEngineTest {
 
         assertTrue(steps.isEmpty());
     }
+
+    @Test public void remoteSendIsOnlyCarriedOutShortlyAfterItWasRequested() {
+        long now = 1_800_000_000_000L;
+        assertFalse(CloudSyncEngine.isStaleRemoteSend(now - 60_000L, now));
+        assertFalse(CloudSyncEngine.isStaleRemoteSend(now + 60_000L, now));
+        assertTrue(CloudSyncEngine.isStaleRemoteSend(
+                now - CloudSyncEngine.REMOTE_SEND_MAX_AGE_MS - 1, now));
+        assertTrue(CloudSyncEngine.isStaleRemoteSend(0L, now));
+    }
+
+    @Test public void retryLaterLeavesDeliveryUnacknowledged() {
+        List<String> steps = new ArrayList<>();
+
+        assertThrows(CloudSyncEngine.RetryLaterException.class,
+                () -> CloudSyncEngine.completeDelivery(
+                        () -> { throw new CloudSyncEngine.RetryLaterException("store busy"); },
+                        steps::add, () -> steps.add("complete delivery")));
+
+        assertTrue(steps.isEmpty());
+    }
 }

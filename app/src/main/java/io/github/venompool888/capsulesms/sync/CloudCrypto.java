@@ -39,6 +39,16 @@ final class CloudCrypto {
         return Base64.encodeToString(keyPair().getPublic().getEncoded(), Base64.NO_WRAP);
     }
 
+    static boolean isUsablePublicKey(String base64) {
+        if (base64 == null || base64.isBlank()) return false;
+        try {
+            decodePublicKey(base64);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     static JSONObject encrypt(
             String eventId, JSONObject payload, List<CloudSyncEngine.Device> targets) throws Exception {
         KeyGenerator generator = KeyGenerator.getInstance("AES");

@@ -36,6 +36,9 @@ public final class CloudSyncEngine {
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
     private static final String PROCESSED_PREFS = "cloud_sync_processed";
     private static final String PROCESSED_KEY = "event_ids";
+    // A remote send is only carried out shortly after it was asked for, never days later when
+    // the SIM comes back. Generous enough for clock differences between the two phones.
+    static final long REMOTE_SEND_MAX_AGE_MS = 30 * 60 * 1000L;
 
     public interface ResultCallback<T> {
         void onResult(T value, Exception error);
@@ -199,7 +202,15 @@ public final class CloudSyncEngine {
         DeviceState state = getDeviceState(context);
         List<Device> targets = new ArrayList<>();
         for (Device device : state.devices) {
-            if (state.pushTo.contains(device.id)) targets.add(device);
+            if (!state.pushTo.contains(device.id)) continue;
+            // FluidCapsule only shows incoming SMS; don't copy sent messages to it.
+            if (device.isReceiveOnly() && type != Telephony.Sms.MESSAGE_TYPE_INBOX) continue;
+            if (!CloudCrypto.isUsablePublicKey(device.publicKey)) {
+                // One device without a usable key must not hold up the whole outbox.
+                config.recordError("设备“" + device.name + "”没有可用的加密公钥，已跳过，请重新连接该设备");
+                continue;
+            }
+            targets.add(device);
         }
         if (targets.isEmpty()) return 0;
         JSONObject payload = new JSONObject()
@@ -229,6 +240,7 @@ public final class CloudSyncEngine {
         if (messages == null) return 0;
         Set<String> processed = loadProcessed(context);
         int inserted = 0;
+        RetryLaterException deferred = null;
         for (int i = 0; i < messages.length(); i++) {
             JSONObject message = messages.getJSONObject(i);
             long deliveryId = message.getLong("deliveryId");
@@ -237,16 +249,26 @@ public final class CloudSyncEngine {
                 acknowledge(config, deliveryId);
                 continue;
             }
-            if (completeDelivery(
-                    () -> applyDelivery(context, state.currentDeviceId, devices, message),
-                    reason -> config.recordError("跳过同步消息 #" + deliveryId + "：" + reason),
-                    () -> {
-                        rememberProcessed(context, processed, eventId);
-                        acknowledge(config, deliveryId);
-                    })) {
-                inserted++;
+            try {
+                if (completeDelivery(
+                        () -> applyDelivery(context, state.currentDeviceId, devices, message),
+                        reason -> config.recordError("跳过同步消息 #" + deliveryId + "：" + reason),
+                        () -> {
+                            rememberProcessed(context, processed, eventId);
+                            acknowledge(config, deliveryId);
+                        })) {
+                    inserted++;
+                }
+            } catch (RetryLaterException error) {
+                // Leave it unacknowledged for the next pull, but keep going so later
+                // messages are not stuck behind it.
+                config.recordError("同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
+                deferred = error;
             }
         }
+        // Fail the pull after the rest went through, so callers back off instead of
+        // spinning on a delivery the server keeps reporting as pending.
+        if (deferred != null) throw deferred;
         return inserted;
     }
 
@@ -277,6 +299,9 @@ public final class CloudSyncEngine {
         Device source = devices.get(message.getString("sourceDeviceId"));
         if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
             throw new CloudCrypto.InvalidEnvelopeException("找不到发送设备的公钥");
+        }
+        if (source.isReceiveOnly()) {
+            throw new InvalidPayloadException("流体胶囊只接收短信，已忽略它发来的消息");
         }
         JSONObject payload = CloudCrypto.decrypt(
                 message.getString("eventId"), currentDeviceId, source.publicKey,
@@ -366,6 +391,9 @@ public final class CloudSyncEngine {
 
     private static void executeRemoteSend(Context context, JSONObject payload)
             throws InvalidPayloadException {
+        if (isStaleRemoteSend(payload.optLong("requestedAt", 0L), System.currentTimeMillis())) {
+            throw new InvalidPayloadException("远端发送指令已过期，未发送");
+        }
         String address = payload.optString("address", "").trim();
         String body = payload.optString("body", "");
         int subscriptionId = payload.optInt("subscriptionId", -1);
@@ -374,11 +402,15 @@ public final class CloudSyncEngine {
             throw new InvalidPayloadException("远端发送指令的收件人、内容或 SIM 无效");
         }
         if (!isActiveSubscription(context, subscriptionId)) {
-            throw new IllegalStateException("远端发送指令的 SIM 不可用");
+            throw new InvalidPayloadException("远端发送指令的 SIM 不可用，未发送");
         }
         boolean dispatched = io.github.venompool888.capsulesms.sms.SmsSender.send(
                 context, address, body, subscriptionId, (success, result) -> {});
-        if (!dispatched) throw new IllegalStateException("无法将短信交给指定 SIM");
+        if (!dispatched) throw new InvalidPayloadException("无法将短信交给指定 SIM，未发送");
+    }
+
+    static boolean isStaleRemoteSend(long requestedAt, long now) {
+        return requestedAt <= 0 || now - requestedAt > REMOTE_SEND_MAX_AGE_MS;
     }
 
     private static void insertPayload(
@@ -408,9 +440,12 @@ public final class CloudSyncEngine {
             saved = SmsRepository.saveSent(context, address, body, timestamp, targetSubscriptionId);
         } else {
             saved = SmsRepository.saveIncoming(context, address, body, timestamp, targetSubscriptionId);
+        }
+        // Checked before notifying, so a retried delivery doesn't notify twice.
+        if (saved == null) throw new RetryLaterException("无法写入系统短信库");
+        if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) {
             SmsDeliverReceiver.notifyIncoming(context, address, body, origin.displayLabel());
         }
-        if (saved == null) throw new IllegalStateException("无法写入系统短信库");
         new CloudMessageOriginStore(context).put(ContentUris.parseId(saved), origin);
     }
 
@@ -464,8 +499,15 @@ public final class CloudSyncEngine {
         }
     }
 
-    private static final class InvalidPayloadException extends Exception {
+    static final class InvalidPayloadException extends Exception {
         InvalidPayloadException(String message) {
+            super(message);
+        }
+    }
+
+    /** A delivery that failed for a local reason that may clear up; retried on a later pull. */
+    static final class RetryLaterException extends Exception {
+        RetryLaterException(String message) {
             super(message);
         }
     }
@@ -485,7 +527,8 @@ public final class CloudSyncEngine {
             JSONObject value = values.getJSONObject(i);
             devices.add(new Device(
                     value.getString("id"), value.optString("name", "未命名设备"),
-                    value.optString("platform", ""), value.optString("publicKey", ""),
+                    value.optString("platform", ""),
+                    value.isNull("publicKey") ? "" : value.optString("publicKey", ""),
                     value.optLong("lastSeenAt", 0L)));
         }
         return new DeviceState(
