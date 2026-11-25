@@ -64,6 +64,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import io.github.venompool888.capsulesms.sms.CopyOtpReceiver;
+import io.github.venompool888.capsulesms.sms.SmsDeliverReceiver;
 import io.github.venompool888.capsulesms.sms.SmsModels;
 import io.github.venompool888.capsulesms.sms.SmsRepository;
 import io.github.venompool888.capsulesms.sms.SmsSender;
@@ -854,7 +856,7 @@ public final class MainActivity extends Activity {
 
     private void putVerificationCodeOnClipboard(String code) {
         ClipboardManager clipboard = getSystemService(ClipboardManager.class);
-        clipboard.setPrimaryClip(ClipData.newPlainText("验证码", code));
+        clipboard.setPrimaryClip(CopyOtpReceiver.verificationCodeClip(code));
     }
 
     private void showComposer() {
@@ -1249,6 +1251,7 @@ public final class MainActivity extends Activity {
         io.execute(() -> {
             SmsRepository repository = new SmsRepository(this);
             repository.markRead(threadId, address);
+            SmsDeliverReceiver.cancelIncoming(this, address);
             if (cachedMessages != null) return;
             List<SmsModels.Message> values = repository.recentMessages(threadId, address, MESSAGE_PAGE_SIZE);
             runOnUiThread(() -> {
@@ -2158,6 +2161,7 @@ public final class MainActivity extends Activity {
             List<SmsModels.Message> openMessages = null;
             if (openAddress != null && !openAddress.isBlank()) {
                 repository.markRead(openThreadId, openAddress);
+                SmsDeliverReceiver.cancelIncoming(this, openAddress);
                 openMessages = repository.recentMessages(openThreadId, openAddress, openMessageLimit);
             }
             saveInboxSnapshot(conversations);
