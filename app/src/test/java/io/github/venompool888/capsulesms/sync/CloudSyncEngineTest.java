@@ -61,6 +61,10 @@ public final class CloudSyncEngineTest {
         assertTrue(CloudSyncEngine.isStaleRemoteSend(
                 now - CloudSyncEngine.REMOTE_SEND_MAX_AGE_MS - 1, now));
         assertTrue(CloudSyncEngine.isStaleRemoteSend(0L, now));
+        assertFalse(CloudSyncEngine.isStaleRemoteSend(
+                now + CloudSyncEngine.REMOTE_SEND_MAX_FUTURE_MS, now));
+        assertTrue(CloudSyncEngine.isStaleRemoteSend(
+                now + CloudSyncEngine.REMOTE_SEND_MAX_FUTURE_MS + 1, now));
     }
 
     @Test public void retryLaterLeavesDeliveryUnacknowledged() {

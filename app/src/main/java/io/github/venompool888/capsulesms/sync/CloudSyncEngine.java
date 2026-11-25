@@ -39,6 +39,8 @@ public final class CloudSyncEngine {
     // A remote send is only carried out shortly after it was asked for, never days later when
     // the SIM comes back. Generous enough for clock differences between the two phones.
     static final long REMOTE_SEND_MAX_AGE_MS = 30 * 60 * 1000L;
+    /** Clock skew allowed between devices; a command dated further ahead can't be trusted to expire. */
+    static final long REMOTE_SEND_MAX_FUTURE_MS = 5 * 60 * 1000L;
 
     public interface ResultCallback<T> {
         void onResult(T value, Exception error);
@@ -420,7 +422,8 @@ public final class CloudSyncEngine {
     }
 
     static boolean isStaleRemoteSend(long requestedAt, long now) {
-        return requestedAt <= 0 || now - requestedAt > REMOTE_SEND_MAX_AGE_MS;
+        return requestedAt <= 0 || now - requestedAt > REMOTE_SEND_MAX_AGE_MS
+                || requestedAt - now > REMOTE_SEND_MAX_FUTURE_MS;
     }
 
     private static void insertPayload(

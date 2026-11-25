@@ -16,6 +16,26 @@ public final class CloudSyncApiTest {
         assertEquals("http://100.64.0.1", CloudSyncApi.normalizeServer("http://100.64.0.1/"));
     }
 
+    @Test public void plainHttpIsOnlyAcceptedForLocalAndPrivateHosts() {
+        for (String ok : new String[] {
+                "http://127.0.0.1:8787", "http://localhost:8787", "http://10.1.2.3",
+                "http://172.16.0.9", "http://172.31.255.1", "http://192.168.1.20:8080",
+                "http://100.64.0.1", "http://100.127.255.254", "http://169.254.10.10",
+                "http://[::1]:8787", "http://[fd7a:115c:a1e0::1]", "http://myserver",
+                "http://nas.local", "http://box.lan", "http://sms.home.arpa",
+                "http://server.tail1234.ts.net:8787", "http://LOCALHOST"}) {
+            assertEquals(ok, CloudSyncApi.normalizeServer(ok));
+        }
+        for (String bad : new String[] {
+                "http://example.com", "http://8.8.8.8", "http://172.32.0.1", "http://100.128.0.1",
+                "http://192.169.1.1", "http://[2001:db8::1]", "http://sms.example.ts.net.evil.com"}) {
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> CloudSyncApi.normalizeServer(bad));
+            assertTrue(bad, error.getMessage().contains("HTTPS"));
+        }
+        assertEquals("https://example.com", CloudSyncApi.normalizeServer("https://example.com"));
+    }
+
     @Test public void normalizeServerRejectsCredentialsAndQuery() {
         assertThrows(IllegalArgumentException.class,
                 () -> CloudSyncApi.normalizeServer("https://user@example.com"));
