@@ -39,6 +39,9 @@ public final class CloudSyncEngine {
     // A remote send is only carried out shortly after it was asked for, never days later when
     // the SIM comes back. Generous enough for clock differences between the two phones.
     static final long REMOTE_SEND_MAX_AGE_MS = 30 * 60 * 1000L;
+    /** Matches the server's LIMIT on GET /api/v1/messages. */
+    static final int PULL_PAGE_SIZE = 100;
+    static final int MAX_PULL_PAGES = 10;
     /** Clock skew allowed between devices; a command dated further ahead can't be trusted to expire. */
     static final long REMOTE_SEND_MAX_FUTURE_MS = 5 * 60 * 1000L;
 
@@ -243,39 +246,44 @@ public final class CloudSyncEngine {
         DeviceState state = getDeviceState(context);
         Map<String, Device> devices = new HashMap<>();
         for (Device device : state.devices) devices.put(device.id, device);
-        JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=0");
-        JSONArray messages = response.optJSONArray("messages");
-        if (messages == null) {
-            config.clearErrorIfNoneSince(CloudSyncConfig.PULL, startedAt);
-            return 0;
-        }
         Set<String> processed = loadProcessed(context);
         int inserted = 0;
         RetryLaterException deferred = null;
-        for (int i = 0; i < messages.length(); i++) {
-            JSONObject message = messages.getJSONObject(i);
-            long deliveryId = message.getLong("deliveryId");
-            String eventId = message.getString("eventId");
-            if (processed.contains(eventId)) {
-                acknowledge(config, deliveryId);
-                continue;
-            }
-            try {
-                if (completeDelivery(
-                        () -> applyDelivery(context, state.currentDeviceId, devices, message),
-                        reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
-                        () -> {
-                            rememberProcessed(context, processed, eventId);
-                            acknowledge(config, deliveryId);
-                        })) {
-                    inserted++;
+        long cursor = 0;
+        // The server returns at most 100 deliveries per page. Follow the cursor so a backlog
+        // (or a run of deliveries left pending for retry) can't hide the messages behind it.
+        for (int page = 0; page < MAX_PULL_PAGES; page++) {
+            JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=" + cursor);
+            JSONArray messages = response.optJSONArray("messages");
+            if (messages == null || messages.length() == 0) break;
+            for (int i = 0; i < messages.length(); i++) {
+                JSONObject message = messages.getJSONObject(i);
+                long deliveryId = message.getLong("deliveryId");
+                String eventId = message.getString("eventId");
+                if (processed.contains(eventId)) {
+                    acknowledge(config, deliveryId);
+                    continue;
                 }
-            } catch (RetryLaterException error) {
-                // Leave it unacknowledged for the next pull, but keep going so later
-                // messages are not stuck behind it.
-                config.recordError(CloudSyncConfig.PULL, "同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
-                deferred = error;
+                try {
+                    if (completeDelivery(
+                            () -> applyDelivery(context, state.currentDeviceId, devices, message),
+                            reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
+                            () -> {
+                                rememberProcessed(context, processed, eventId);
+                                acknowledge(config, deliveryId);
+                            })) {
+                        inserted++;
+                    }
+                } catch (RetryLaterException error) {
+                    // Leave it unacknowledged for the next pull, but keep going so later
+                    // messages are not stuck behind it.
+                    config.recordError(CloudSyncConfig.PULL, "同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
+                    deferred = error;
+                }
             }
+            long next = response.optLong("nextCursor", cursor);
+            if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
+            cursor = next;
         }
         // Fail the pull after the rest went through, so callers back off instead of
         // spinning on a delivery the server keeps reporting as pending.
