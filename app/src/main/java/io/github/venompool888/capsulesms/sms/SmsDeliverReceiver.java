@@ -87,6 +87,16 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
                     R.drawable.ic_copy_code, otp.code(), copyAction).build());
         }
 
-        manager.notify(address.hashCode(), notification.build());
+        manager.notify(incomingNotificationId(address), notification.build());
+    }
+
+    /** Clears the new-SMS notification once the conversation has been opened and read. */
+    public static void cancelIncoming(Context context, String address) {
+        if (address == null || address.isBlank()) return;
+        context.getSystemService(NotificationManager.class).cancel(incomingNotificationId(address));
+    }
+
+    private static int incomingNotificationId(String address) {
+        return address.hashCode();
     }
 }

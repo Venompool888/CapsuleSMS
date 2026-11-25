@@ -2,9 +2,11 @@ package io.github.venompool888.capsulesms.sms;
 
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
+import android.content.ClipDescription;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.os.PersistableBundle;
 import android.widget.Toast;
 
 /** Handles the lock-screen notification action without opening the app. */
@@ -19,7 +21,16 @@ public final class CopyOtpReceiver extends BroadcastReceiver {
         if (code == null || code.isBlank()) return;
 
         ClipboardManager clipboard = context.getSystemService(ClipboardManager.class);
-        clipboard.setPrimaryClip(ClipData.newPlainText("验证码", code));
+        clipboard.setPrimaryClip(verificationCodeClip(code));
         Toast.makeText(context, "验证码已复制", Toast.LENGTH_SHORT).show();
+    }
+
+    /** A verification code clip that Android keeps out of the clipboard preview and keyboard history. */
+    public static ClipData verificationCodeClip(String code) {
+        ClipData clip = ClipData.newPlainText("验证码", code);
+        PersistableBundle extras = new PersistableBundle();
+        extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true);
+        clip.getDescription().setExtras(extras);
+        return clip;
     }
 }
