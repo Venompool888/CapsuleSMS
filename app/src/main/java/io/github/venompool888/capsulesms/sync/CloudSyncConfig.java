@@ -32,10 +32,42 @@ public final class CloudSyncConfig {
     public String deviceId() { return prefs.getString("device_id", ""); }
     public String account() { return prefs.getString("account", ""); }
 
-    String lastError() { return prefs.getString("last_error", ""); }
+    /** Errors are kept per channel so a clean upload doesn't hide a pull problem, or the reverse. */
+    static final String UPLOAD = "upload";
+    static final String PULL = "pull";
 
-    void recordError(String message) {
-        prefs.edit().putString("last_error", message).apply();
+    /** The most recent error that a later clean run of the same channel hasn't cleared. */
+    String lastError() {
+        String current = newestError(
+                prefs.getString("last_error_" + UPLOAD, ""), prefs.getLong("last_error_at_" + UPLOAD, 0),
+                prefs.getString("last_error_" + PULL, ""), prefs.getLong("last_error_at_" + PULL, 0));
+        // Until the first clean run removes it, still show an error left by an older build.
+        return current.isBlank() ? prefs.getString("last_error", "") : current;
+    }
+
+    void recordError(String channel, String message) {
+        prefs.edit()
+                .putString("last_error_" + channel, message)
+                .putLong("last_error_at_" + channel, System.currentTimeMillis())
+                .apply();
+    }
+
+    /** Clears the channel's error unless it was recorded at or after {@code runStartedAt}. */
+    void clearErrorIfNoneSince(String channel, long runStartedAt) {
+        if (prefs.getLong("last_error_at_" + channel, 0) >= runStartedAt) return;
+        SharedPreferences.Editor editor = prefs.edit()
+                .remove("last_error_" + channel)
+                .remove("last_error_at_" + channel);
+        // Written by builds before errors were split per channel, and never cleared. Only a
+        // pull proves the server answered; an empty outbox flush succeeds even offline.
+        if (PULL.equals(channel)) editor.remove("last_error");
+        editor.apply();
+    }
+
+    static String newestError(String first, long firstAt, String second, long secondAt) {
+        if (first.isBlank()) return second;
+        if (second.isBlank()) return first;
+        return secondAt > firstAt ? second : first;
     }
 
     public String token() {
