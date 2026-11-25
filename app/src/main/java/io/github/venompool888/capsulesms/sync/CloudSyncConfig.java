@@ -55,12 +55,13 @@ public final class CloudSyncConfig {
     /** Clears the channel's error unless it was recorded at or after {@code runStartedAt}. */
     void clearErrorIfNoneSince(String channel, long runStartedAt) {
         if (prefs.getLong("last_error_at_" + channel, 0) >= runStartedAt) return;
-        prefs.edit()
+        SharedPreferences.Editor editor = prefs.edit()
                 .remove("last_error_" + channel)
-                .remove("last_error_at_" + channel)
-                // Written by builds before errors were split per channel; it was never cleared.
-                .remove("last_error")
-                .apply();
+                .remove("last_error_at_" + channel);
+        // Written by builds before errors were split per channel, and never cleared. Only a
+        // pull proves the server answered; an empty outbox flush succeeds even offline.
+        if (PULL.equals(channel)) editor.remove("last_error");
+        editor.apply();
     }
 
     static String newestError(String first, long firstAt, String second, long secondAt) {
