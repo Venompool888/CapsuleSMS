@@ -196,6 +196,31 @@ test("routes cannot target a device from another account", async () => {
   assert.deepEqual(state.pushTo, []);
 });
 
+test("a receive-only FluidCapsule device cannot post messages, even back along a route", async () => {
+  const credentials = { username: "sync-user", password: "correct-horse-battery-staple" };
+  const phone = await connect({ ...credentials, deviceName: "Phone", platform: "android-17",
+    publicKey: "phone-public-key" });
+  const capsule = await connect({ ...credentials, deviceName: "FluidCapsule",
+    platform: "fluidcapsule-android", publicKey: "capsule-public-key" });
+  await api(phone.deviceToken, "/api/v1/sync-routes", {
+    method: "PUT",
+    body: { pushTo: [capsule.deviceId], receiveFrom: [] },
+  });
+  for (const body of [
+    { eventId: `${capsule.deviceId}:send-0001`, targetDeviceId: phone.deviceId,
+      envelope: { algorithm: "test-only", ciphertext: "send-command" } },
+    { eventId: `${capsule.deviceId}:push-0001`,
+      envelope: { algorithm: "test-only", ciphertext: "fake-sms" } },
+  ]) {
+    const rejected = await api(capsule.deviceToken, "/api/v1/messages", {
+      method: "POST", body, expectedStatus: 403,
+    });
+    assert.equal(rejected.error, "receive_only_device");
+  }
+  const phoneInbox = await api(phone.deviceToken, "/api/v1/messages");
+  assert.equal(phoneInbox.messages.length, 0);
+});
+
 async function connect(body) {
   const response = await fetch(`${baseUrl}/api/v1/connect`, {
     method: "POST",

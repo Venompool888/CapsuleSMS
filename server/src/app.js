@@ -25,6 +25,7 @@ import {
 
 const COOKIE_NAME = "capsule_session";
 const MAX_ENVELOPE_BYTES = 64 * 1024;
+const RECEIVE_ONLY_PLATFORM = "fluidcapsule-android";
 
 export function createApp({ db, config }) {
   const app = express();
@@ -181,16 +182,22 @@ export function createApp({ db, config }) {
     res.json(deviceState(db, req.device));
   });
   app.post("/api/v1/messages", (req, res) => {
+    // FluidCapsule only displays SMS. Without this, a receive-only device could use the
+    // reverse direction of a phone→FluidCapsule route to make the phone send or store SMS.
+    if (req.device.platform === RECEIVE_ONLY_PLATFORM) {
+      return jsonError(res, 403, "receive_only_device", "此设备只能接收短信");
+    }
     const eventId = String(req.body.eventId ?? "");
     if (!/^[A-Za-z0-9._:-]{8,128}$/.test(eventId)) {
       return jsonError(res, 400, "invalid_event_id", "eventId 格式无效");
     }
-    const envelope = JSON.stringify(req.body.envelope);
-    if (!req.body.envelope || Buffer.byteLength(envelope) > MAX_ENVELOPE_BYTES) {
+    const envelopeBody = req.body.envelope;
+    const envelope = JSON.stringify(envelopeBody);
+    if (!envelopeBody || Buffer.byteLength(envelope) > MAX_ENVELOPE_BYTES) {
       return jsonError(res, 413, "invalid_envelope", "加密信封为空或超过 64 KiB");
     }
     const requestedTarget = String(req.body.targetDeviceId ?? "").trim();
-    const targets = requestedTarget
+    const routedTargets = requestedTarget
       ? db.prepare(`
           SELECT d.id FROM devices d
           WHERE d.id = ? AND d.user_id = ? AND d.enabled = 1 AND d.id != ?
@@ -205,6 +212,11 @@ export function createApp({ db, config }) {
           SELECT d.id FROM sync_routes r JOIN devices d ON d.id = r.target_device_id
           WHERE r.source_device_id = ? AND d.enabled = 1
         `).all(req.device.id);
+    // A route can be added after the sender fetched its recipients. That device
+    // cannot decrypt an envelope until the sender has wrapped a key for it.
+    const targets = envelopeBody.version === 1 && envelopeBody.algorithm === "ECDH-P256+A256GCM"
+      ? routedTargets.filter(({ id }) => Object.hasOwn(envelopeBody.wrappedKeys ?? {}, id))
+      : routedTargets;
     const now = Date.now();
     const expiresAt = now + config.messageTtlMs;
     const insert = db.prepare(`

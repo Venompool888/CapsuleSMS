@@ -12,10 +12,12 @@ import android.telephony.PhoneNumberUtils;
 import android.telephony.SubscriptionManager;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Collections;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -25,6 +27,10 @@ import java.nio.charset.StandardCharsets;
 
 public final class SmsRepository {
     private static final Uri SMS_URI = Telephony.Sms.CONTENT_URI;
+    private static final Comparator<SmsModels.Message> MESSAGE_ORDER = Comparator
+            .comparingLong(SmsModels.Message::date).thenComparingLong(SmsModels.Message::id);
+    private static final Comparator<MmsPageRow> MMS_PAGE_ORDER = Comparator
+            .comparingLong(MmsPageRow::date).thenComparingLong(row -> -row.id());
     private final Context context;
     private final ContentResolver resolver;
     private final CloudMessageOriginStore originStore;
@@ -96,16 +102,28 @@ public final class SmsRepository {
     }
 
     public List<SmsModels.Message> recentMessages(long threadId, String address, int limit) {
+        return messagesBefore(threadId, address, null, limit);
+    }
+
+    /** Returns the page strictly before the cursor in timestamp and message ID order. */
+    public List<SmsModels.Message> messagesBefore(
+            long threadId, String address, SmsModels.Message before, int limit) {
+        if (limit <= 0) return List.of();
         List<SmsModels.Message> result = new ArrayList<>();
         String[] projection = {
                 "_id", "thread_id", "address", "body", "date", "type", "status"
         };
         String selection = threadId > 0 ? "thread_id = ?" : "address = ?";
         String[] args = {threadId > 0 ? Long.toString(threadId) : address};
+        if (before != null) {
+            selection += " AND (date < ? OR (date = ? AND _id < ?))";
+            String date = Long.toString(before.date());
+            args = new String[]{args[0], date, date, Long.toString(before.id())};
+        }
         try (Cursor cursor = resolver.query(
                 SMS_URI, projection, selection, args,
-                "date DESC LIMIT " + Math.max(1, limit))) {
-            if (cursor != null) while (cursor.moveToNext()) {
+                "date DESC, _id DESC")) {
+            if (cursor != null) while (result.size() < limit && cursor.moveToNext()) {
                 long id = cursor.getLong(0);
                 result.add(new SmsModels.Message(
                         id, id, cursor.getLong(1), safe(cursor.getString(2), address),
@@ -115,34 +133,68 @@ public final class SmsRepository {
                         List.of(), originStore.getOrigin(id)));
             }
         }
-        if (threadId > 0) {
-            String[] mmsProjection = {
-                    "_id", "thread_id", "date", "date_sent", "msg_box", "sub_id", "sub", "st"
-            };
-            try (Cursor cursor = resolver.query(Telephony.Mms.CONTENT_URI, mmsProjection,
-                    "thread_id = ?", new String[]{Long.toString(threadId)},
-                    "date DESC LIMIT " + Math.max(1, limit))) {
-                if (cursor != null) while (cursor.moveToNext()) {
-                    long id = cursor.getLong(0);
-                    int box = cursor.getInt(4);
-                    List<SmsModels.Attachment> attachments = new ArrayList<>();
-                    String partText = mmsBodyAndAttachments(id, attachments);
-                    String subject = safe(cursor.getString(6), "");
-                    String body = joinMmsText(subject, partText, attachments);
-                    List<String> recipients = mmsRecipients(id, cursor.getInt(5), box);
-                    String sender = recipients.isEmpty() ? address : String.join("、", recipients);
-                    result.add(new SmsModels.Message(
-                            -id, id, cursor.getLong(1), sender, body,
-                            mmsDateMillis(cursor.getLong(2), cursor.getLong(3)), box,
-                            SmsModels.Message.Transport.MMS, mmsDelivery(box, cursor.getInt(7)),
-                            attachments, null));
-                }
-            }
+        if (threadId > 0) for (MmsPageRow row : mmsPage(threadId, before, limit)) {
+            result.add(readMmsMessage(threadId, address, row));
         }
-        result.sort((left, right) -> Long.compare(left.date(), right.date()));
+        result.sort(MESSAGE_ORDER);
         if (result.size() > limit) return new ArrayList<>(
                 result.subList(result.size() - limit, result.size()));
         return result;
+    }
+
+    private Iterable<MmsPageRow> mmsPage(long threadId, SmsModels.Message before, int limit) {
+        String[] projection = {"_id", "date", "date_sent", "msg_box", "sub_id", "sub", "st"};
+        PriorityQueue<MmsPageRow> rows = new PriorityQueue<>(MMS_PAGE_ORDER);
+        // The displayed date can come from date_sent and either source can be in seconds.
+        try (Cursor cursor = resolver.query(Telephony.Mms.CONTENT_URI, projection,
+                "thread_id = ?", new String[]{Long.toString(threadId)}, null)) {
+            if (cursor != null) while (cursor.moveToNext()) {
+                long id = cursor.getLong(0);
+                long date = mmsDateMillis(cursor.getLong(1), cursor.getLong(2));
+                if (before != null && (date > before.date()
+                        || (date == before.date() && -id >= before.id()))) continue;
+                rows.add(new MmsPageRow(id, date, cursor.getInt(3), cursor.getInt(4),
+                        safe(cursor.getString(5), ""), cursor.getInt(6)));
+                if (rows.size() > limit) rows.remove();
+            }
+        }
+        return rows;
+    }
+
+    private SmsModels.Message readMmsMessage(long threadId, String address, MmsPageRow row) {
+        List<SmsModels.Attachment> attachments = new ArrayList<>();
+        String partText = mmsBodyAndAttachments(row.id(), attachments);
+        String body = joinMmsText(row.subject(), partText, attachments);
+        List<String> recipients = mmsRecipients(row.id(), row.subscriptionId(), row.box());
+        String sender = recipients.isEmpty() ? address : String.join("、", recipients);
+        return new SmsModels.Message(-row.id(), row.id(), threadId, sender, body, row.date(),
+                row.box(), SmsModels.Message.Transport.MMS, mmsDelivery(row.box(), row.status()),
+                attachments, null);
+    }
+
+    private static final class MmsPageRow {
+        private final long id;
+        private final long date;
+        private final int box;
+        private final int subscriptionId;
+        private final String subject;
+        private final int status;
+
+        MmsPageRow(long id, long date, int box, int subscriptionId, String subject, int status) {
+            this.id = id;
+            this.date = date;
+            this.box = box;
+            this.subscriptionId = subscriptionId;
+            this.subject = subject;
+            this.status = status;
+        }
+
+        long id() { return id; }
+        long date() { return date; }
+        int box() { return box; }
+        int subscriptionId() { return subscriptionId; }
+        String subject() { return subject; }
+        int status() { return status; }
     }
 
     public CloudMessageOriginStore.Origin latestCloudOrigin(String address) {
