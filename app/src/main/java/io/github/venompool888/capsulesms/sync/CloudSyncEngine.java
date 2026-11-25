@@ -179,6 +179,7 @@ public final class CloudSyncEngine {
 
     public static synchronized int flushOutbox(Context context) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
+        long startedAt = System.currentTimeMillis();
         int uploaded = 0;
         for (JSONObject event : CloudSyncOutbox.all(context)) {
             String eventId = event.getString("eventId");
@@ -189,10 +190,11 @@ public final class CloudSyncEngine {
                         event.optInt("subscriptionId", -1), event.getInt("type"));
                 uploaded++;
             } catch (CloudSyncApi.RejectedEnvelopeException error) {
-                config.recordError("同步短信已跳过：" + error.getMessage());
+                config.recordError(CloudSyncConfig.UPLOAD, "同步短信已跳过：" + error.getMessage());
             }
             CloudSyncOutbox.remove(context, eventId);
         }
+        config.clearErrorIfNoneSince(CloudSyncConfig.UPLOAD, startedAt);
         return uploaded;
     }
 
@@ -207,7 +209,7 @@ public final class CloudSyncEngine {
             if (device.isReceiveOnly() && type != Telephony.Sms.MESSAGE_TYPE_INBOX) continue;
             if (!CloudCrypto.isUsablePublicKey(device.publicKey)) {
                 // One device without a usable key must not hold up the whole outbox.
-                config.recordError("设备“" + device.name + "”没有可用的加密公钥，已跳过，请重新连接该设备");
+                config.recordError(CloudSyncConfig.UPLOAD, "设备“" + device.name + "”没有可用的加密公钥，已跳过，请重新连接该设备");
                 continue;
             }
             targets.add(device);
@@ -232,12 +234,16 @@ public final class CloudSyncEngine {
 
     public static synchronized int pull(Context context) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
+        long startedAt = System.currentTimeMillis();
         DeviceState state = getDeviceState(context);
         Map<String, Device> devices = new HashMap<>();
         for (Device device : state.devices) devices.put(device.id, device);
         JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=0");
         JSONArray messages = response.optJSONArray("messages");
-        if (messages == null) return 0;
+        if (messages == null) {
+            config.clearErrorIfNoneSince(CloudSyncConfig.PULL, startedAt);
+            return 0;
+        }
         Set<String> processed = loadProcessed(context);
         int inserted = 0;
         RetryLaterException deferred = null;
@@ -252,7 +258,7 @@ public final class CloudSyncEngine {
             try {
                 if (completeDelivery(
                         () -> applyDelivery(context, state.currentDeviceId, devices, message),
-                        reason -> config.recordError("跳过同步消息 #" + deliveryId + "：" + reason),
+                        reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
                         () -> {
                             rememberProcessed(context, processed, eventId);
                             acknowledge(config, deliveryId);
@@ -262,13 +268,14 @@ public final class CloudSyncEngine {
             } catch (RetryLaterException error) {
                 // Leave it unacknowledged for the next pull, but keep going so later
                 // messages are not stuck behind it.
-                config.recordError("同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
+                config.recordError(CloudSyncConfig.PULL, "同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
                 deferred = error;
             }
         }
         // Fail the pull after the rest went through, so callers back off instead of
         // spinning on a delivery the server keeps reporting as pending.
         if (deferred != null) throw deferred;
+        config.clearErrorIfNoneSince(CloudSyncConfig.PULL, startedAt);
         return inserted;
     }
 
