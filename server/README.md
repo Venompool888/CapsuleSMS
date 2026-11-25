@@ -112,6 +112,7 @@ Authorization: Bearer <deviceToken>
 | `POST` | `/api/v1/connect` | 密码或注册码连接新设备 |
 | `GET` | `/api/v1/devices` | 设备列表及本机推送/接收关系 |
 | `PUT` | `/api/v1/sync-routes` | 原子更新本机 `pushTo` 和 `receiveFrom` |
+| `POST` | `/api/v1/devices/self/revoke` | 本机断开时撤销自己的令牌和同步关系 |
 | `POST` | `/api/v1/messages` | 将一个加密信封扇出到已选择目标 |
 | `GET` | `/api/v1/messages?after=0` | 按游标拉取本设备的待收消息 |
 | `GET` | `/api/v1/messages/wait?timeout=25` | 等待待收消息，新增投递时立即唤醒 |

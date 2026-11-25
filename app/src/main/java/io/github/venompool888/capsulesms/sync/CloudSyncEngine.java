@@ -321,6 +321,30 @@ public final class CloudSyncEngine {
         processPayload(context, payload, source);
     }
 
+    /**
+     * Retires this device on the server (token and routes), then forgets the connection
+     * locally. The local side always disconnects; returns false only if the server could
+     * not be told, so the device is still listed there until revoked on the web.
+     */
+    public static boolean disconnect(Context context) {
+        CloudSyncConfig config = new CloudSyncConfig(context);
+        boolean revoked = !config.isConnected();
+        if (!revoked) {
+            try {
+                CloudSyncApi.post(config, "/api/v1/devices/self/revoke", new JSONObject());
+                revoked = true;
+            } catch (CloudSyncApi.ApiException error) {
+                // 401: the token was already revoked, which is the state we wanted.
+                revoked = error.status == 401;
+            } catch (Exception offlineOrOldServer) {
+                revoked = false;
+            }
+        }
+        config.clear();
+        CloudSyncScheduler.cancel(context);
+        return revoked;
+    }
+
     public static void syncAsync(Context context, ResultCallback<Integer> callback) {
         Context app = context.getApplicationContext();
         EXECUTOR.execute(() -> {

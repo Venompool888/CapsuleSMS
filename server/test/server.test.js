@@ -221,6 +221,28 @@ test("a receive-only FluidCapsule device cannot post messages, even back along a
   assert.equal(phoneInbox.messages.length, 0);
 });
 
+test("a disconnecting device can revoke itself, which drops its token and routes", async () => {
+  const credentials = { username: "sync-user", password: "correct-horse-battery-staple" };
+  const leaving = await connect({ ...credentials, deviceName: "Leaving phone" });
+  const staying = await connect({ ...credentials, deviceName: "Staying tablet" });
+  await api(leaving.deviceToken, "/api/v1/sync-routes", {
+    method: "PUT",
+    body: { pushTo: [staying.deviceId], receiveFrom: [staying.deviceId] },
+  });
+  assert.ok((await api(staying.deviceToken, "/api/v1/devices")).receiveFrom.includes(leaving.deviceId));
+
+  assert.deepEqual(
+    await api(leaving.deviceToken, "/api/v1/devices/self/revoke", { method: "POST", body: {} }),
+    { revoked: true },
+  );
+
+  await api(leaving.deviceToken, "/api/v1/devices", { expectedStatus: 401 });
+  const after = await api(staying.deviceToken, "/api/v1/devices");
+  assert.equal(after.receiveFrom.includes(leaving.deviceId), false);
+  assert.equal(after.pushTo.includes(leaving.deviceId), false);
+  assert.equal(after.devices.some((device) => device.id === leaving.deviceId), false);
+});
+
 async function connect(body) {
   const response = await fetch(`${baseUrl}/api/v1/connect`, {
     method: "POST",
