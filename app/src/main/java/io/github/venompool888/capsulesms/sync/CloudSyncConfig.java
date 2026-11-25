@@ -38,9 +38,11 @@ public final class CloudSyncConfig {
 
     /** The most recent error that a later clean run of the same channel hasn't cleared. */
     String lastError() {
-        return newestError(
+        String current = newestError(
                 prefs.getString("last_error_" + UPLOAD, ""), prefs.getLong("last_error_at_" + UPLOAD, 0),
                 prefs.getString("last_error_" + PULL, ""), prefs.getLong("last_error_at_" + PULL, 0));
+        // Until the first clean run removes it, still show an error left by an older build.
+        return current.isBlank() ? prefs.getString("last_error", "") : current;
     }
 
     void recordError(String channel, String message) {
