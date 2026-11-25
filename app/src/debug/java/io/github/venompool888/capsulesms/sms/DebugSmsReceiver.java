@@ -24,11 +24,23 @@ public final class DebugSmsReceiver extends BroadcastReceiver {
             "io.github.venompool888.capsulesms.debug.UPLOAD_RECENT_SENT";
     private static final String ACTION_UPLOAD_CONVERSATION =
             "io.github.venompool888.capsulesms.debug.UPLOAD_CONVERSATION";
+    private static final String ACTION_RECORD_SEND_STATUS =
+            "io.github.venompool888.capsulesms.debug.RECORD_SEND_STATUS";
     private static final String TEST_ADDRESS_PREFIX = "CloudSync";
     private static final String REALTIME_TEST_ADDRESS_PREFIX = "CloudRealtime";
     private static final String LINE_TEST_ADDRESS = "CloudLineRouteTest";
 
     @Override public void onReceive(Context context, Intent intent) {
+        if (ACTION_RECORD_SEND_STATUS.equals(intent.getAction())) {
+            // Store-only: records a fake "sent" callback without touching the SMS provider.
+            SmsSendStatusStore store = new SmsSendStatusStore(context);
+            store.recordSent(intent.getLongExtra("message_id", -1L), 0,
+                    Math.max(1, intent.getIntExtra("part_count", 2)), true, 0);
+            setResultCode(1);
+            setResultData("entries=" + context.getSharedPreferences("sms_send_status",
+                    Context.MODE_PRIVATE).getAll().size());
+            return;
+        }
         if (ACTION_UPLOAD_CONVERSATION.equals(intent.getAction())) {
             uploadConversation(context, intent.getStringExtra("address"));
             return;
