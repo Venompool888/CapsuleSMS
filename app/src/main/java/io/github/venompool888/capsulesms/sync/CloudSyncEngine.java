@@ -174,18 +174,22 @@ public final class CloudSyncEngine {
             int subscriptionId, int type) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
         String eventId = config.deviceId() + ":" + UUID.randomUUID();
-        return uploadEvent(context, config, eventId, address, body, timestamp, subscriptionId, type);
+        return uploadEvent(context, config, getDeviceState(context), eventId,
+                address, body, timestamp, subscriptionId, type);
     }
 
     public static synchronized int flushOutbox(Context context) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
         long startedAt = System.currentTimeMillis();
         int uploaded = 0;
+        // One device list per flush: a backlog of N messages used to cost N extra requests.
+        DeviceState state = null;
         for (JSONObject event : CloudSyncOutbox.all(context)) {
             String eventId = event.getString("eventId");
+            if (state == null) state = getDeviceState(context);
             try {
                 uploadEvent(
-                        context, config, eventId, event.getString("address"),
+                        context, config, state, eventId, event.getString("address"),
                         event.getString("body"), event.getLong("timestamp"),
                         event.optInt("subscriptionId", -1), event.getInt("type"));
                 uploaded++;
@@ -199,9 +203,8 @@ public final class CloudSyncEngine {
     }
 
     private static int uploadEvent(
-            Context context, CloudSyncConfig config, String eventId,
+            Context context, CloudSyncConfig config, DeviceState state, String eventId,
             String address, String body, long timestamp, int subscriptionId, int type) throws Exception {
-        DeviceState state = getDeviceState(context);
         List<Device> targets = new ArrayList<>();
         for (Device device : state.devices) {
             if (!state.pushTo.contains(device.id)) continue;
