@@ -768,18 +768,32 @@ public final class CloudSyncActivity extends Activity {
     private void confirmDisconnect() {
         new AlertDialog.Builder(this)
                 .setTitle("断开本机连接？")
-                .setMessage("本机会停止云同步，服务器上的设备记录仍可由网页管理。")
+                .setMessage("本机会停止云同步，并从服务器撤销这台设备。以后重新连接需要新的注册码。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("断开", (dialog, which) -> {
                     if (requestInFlight || savingRoutes) return;
-                    new CloudSyncConfig(this).clear();
-                    CloudSyncScheduler.cancel(this);
-                    useEnrollmentCode = true;
-                    lastState = null;
-                    lastError = null;
-                    pushTo.clear();
-                    receiveFrom.clear();
-                    renderConnectForm();
+                    requestInFlight = true;
+                    disableFooter("立即同步", "刷新设备");
+                    if (disconnectButton != null) disconnectButton.setText("正在断开…");
+                    beginOperation();
+                    io.execute(() -> {
+                        boolean revoked = CloudSyncEngine.disconnect(this);
+                        runOnUiThread(() -> {
+                            if (isFinishing() || isDestroyed()) return;
+                            requestInFlight = false;
+                            endOperation();
+                            useEnrollmentCode = true;
+                            lastState = null;
+                            lastError = null;
+                            pushTo.clear();
+                            receiveFrom.clear();
+                            renderConnectForm();
+                            if (!revoked) {
+                                Toast.makeText(this, "已在本机断开，但没能通知服务器。可在网页管理中撤销这台设备。",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    });
                 })
                 .show();
     }

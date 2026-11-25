@@ -117,19 +117,7 @@ export function createApp({ db, config }) {
     res.send(enrollmentPage(req.webUser, enrollment, qrSvg, config.publicBaseUrl));
   }));
   app.post("/portal/devices/:id/revoke", requireWebUser(db), requireCsrf, (req, res) => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const changed = db.prepare("UPDATE devices SET enabled = 0 WHERE id = ? AND user_id = ?")
-        .run(req.params.id, req.webUser.id);
-      if (changed.changes) {
-        db.prepare("DELETE FROM sync_routes WHERE source_device_id = ? OR target_device_id = ?")
-          .run(req.params.id, req.params.id);
-      }
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
+    revokeDevice(db, req.params.id, req.webUser.id);
     res.redirect("/portal?message=" + encodeURIComponent("设备已撤销"));
   });
   app.post("/portal/routes", requireWebUser(db), requireCsrf, (req, res) => {
@@ -180,6 +168,11 @@ export function createApp({ db, config }) {
       req.body.receiveFrom,
     );
     res.json(deviceState(db, req.device));
+  });
+  // Lets a device that is disconnecting retire its own token and routes.
+  app.post("/api/v1/devices/self/revoke", (req, res) => {
+    revokeDevice(db, req.device.id, req.device.user_id);
+    res.json({ revoked: true });
   });
   app.post("/api/v1/messages", (req, res) => {
     // FluidCapsule only displays SMS. Without this, a receive-only device could use the
@@ -386,6 +379,23 @@ function requireDevice(db) {
     req.device = device;
     next();
   };
+}
+
+function revokeDevice(db, deviceId, userId) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const changed = db.prepare("UPDATE devices SET enabled = 0 WHERE id = ? AND user_id = ?")
+      .run(deviceId, userId);
+    if (changed.changes) {
+      db.prepare("DELETE FROM sync_routes WHERE source_device_id = ? OR target_device_id = ?")
+        .run(deviceId, deviceId);
+    }
+    db.exec("COMMIT");
+    return changed.changes > 0;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function requireSecureRequest(req, config) {
