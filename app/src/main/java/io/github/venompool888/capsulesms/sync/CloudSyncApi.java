@@ -24,10 +24,54 @@ final class CloudSyncApi {
                     || uri.getRawQuery() != null || uri.getRawFragment() != null) {
                 throw new IllegalArgumentException();
             }
+            if ("http".equalsIgnoreCase(uri.getScheme()) && !isPrivateHost(uri.getHost())) {
+                throw new InsecureServerException();
+            }
             return value;
+        } catch (InsecureServerException error) {
+            // Checked before connecting: the server's own 426 would come after the code was sent.
+            throw new IllegalArgumentException(
+                    "未加密的 HTTP 只能用于本机或私有网络（如 Tailscale IP）。公网服务器请使用 HTTPS 地址。");
         } catch (RuntimeException error) {
             throw new IllegalArgumentException("服务器地址必须是完整的 HTTP(S) 地址");
         }
+    }
+
+    private static final class InsecureServerException extends RuntimeException {}
+
+    /** Loopback, LAN, link-local, Tailscale/CGNAT and local-only names. Parsed only, never resolved. */
+    static boolean isPrivateHost(String rawHost) {
+        String host = rawHost.toLowerCase(java.util.Locale.ROOT);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            String v6 = host.substring(1, host.length() - 1);
+            return v6.equals("::1") || v6.startsWith("fc") || v6.startsWith("fd")
+                    || v6.startsWith("fe8") || v6.startsWith("fe9")
+                    || v6.startsWith("fea") || v6.startsWith("feb");
+        }
+        int[] v4 = parseIpv4(host);
+        if (v4 != null) {
+            return v4[0] == 127 || v4[0] == 10
+                    || (v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31)
+                    || (v4[0] == 192 && v4[1] == 168)
+                    || (v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127)
+                    || (v4[0] == 169 && v4[1] == 254);
+        }
+        if (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+        return host.equals("localhost") || !host.contains(".")
+                || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".lan")
+                || host.endsWith(".internal") || host.endsWith(".home.arpa") || host.endsWith(".ts.net");
+    }
+
+    private static int[] parseIpv4(String host) {
+        String[] parts = host.split("\\.", -1);
+        if (parts.length != 4) return null;
+        int[] octets = new int[4];
+        for (int i = 0; i < 4; i++) {
+            if (parts[i].isEmpty() || parts[i].length() > 3 || !parts[i].chars().allMatch(Character::isDigit)) return null;
+            octets[i] = Integer.parseInt(parts[i]);
+            if (octets[i] > 255) return null;
+        }
+        return octets;
     }
 
     static JSONObject connect(String server, JSONObject body) throws Exception {
