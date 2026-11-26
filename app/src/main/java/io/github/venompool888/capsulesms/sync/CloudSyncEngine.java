@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.Context;
 import android.content.ContentUris;
 import android.content.pm.PackageManager;
+import android.util.Log;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
@@ -243,7 +244,10 @@ public final class CloudSyncEngine {
     public static synchronized int pull(Context context) throws Exception {
         CloudSyncConfig config = connectedConfig(context);
         long startedAt = System.currentTimeMillis();
+        PullTimings timings = new PullTimings();
+        long phase = System.nanoTime();
         DeviceState state = getDeviceState(context);
+        timings.state += System.nanoTime() - phase;
         Map<String, Device> devices = new HashMap<>();
         for (Device device : state.devices) devices.put(device.id, device);
         Set<String> processed = loadProcessed(context);
@@ -253,24 +257,30 @@ public final class CloudSyncEngine {
         // The server returns at most 100 deliveries per page. Follow the cursor so a backlog
         // (or a run of deliveries left pending for retry) can't hide the messages behind it.
         for (int page = 0; page < MAX_PULL_PAGES; page++) {
+            phase = System.nanoTime();
             JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=" + cursor);
+            timings.list += System.nanoTime() - phase;
+            timings.pages++;
             JSONArray messages = response.optJSONArray("messages");
             if (messages == null || messages.length() == 0) break;
             for (int i = 0; i < messages.length(); i++) {
                 JSONObject message = messages.getJSONObject(i);
                 long deliveryId = message.getLong("deliveryId");
                 String eventId = message.getString("eventId");
+                timings.messages++;
                 if (processed.contains(eventId)) {
-                    acknowledge(config, deliveryId);
+                    acknowledge(config, deliveryId, timings);
                     continue;
                 }
                 try {
                     if (completeDelivery(
-                            () -> applyDelivery(context, state.currentDeviceId, devices, message),
+                            () -> applyDelivery(context, state.currentDeviceId, devices, message, timings),
                             reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
                             () -> {
+                                long remembered = System.nanoTime();
                                 rememberProcessed(context, processed, eventId);
-                                acknowledge(config, deliveryId);
+                                timings.remember += System.nanoTime() - remembered;
+                                acknowledge(config, deliveryId, timings);
                             })) {
                         inserted++;
                     }
@@ -285,6 +295,7 @@ public final class CloudSyncEngine {
             if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
             cursor = next;
         }
+        timings.log(startedAt);
         // Fail the pull after the rest went through, so callers back off instead of
         // spinning on a delivery the server keeps reporting as pending.
         if (deferred != null) throw deferred;
@@ -314,8 +325,8 @@ public final class CloudSyncEngine {
     }
 
     private static void applyDelivery(
-            Context context, String currentDeviceId, Map<String, Device> devices, JSONObject message)
-            throws Exception {
+            Context context, String currentDeviceId, Map<String, Device> devices, JSONObject message,
+            PullTimings timings) throws Exception {
         Device source = devices.get(message.getString("sourceDeviceId"));
         if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
             throw new CloudCrypto.InvalidEnvelopeException("找不到发送设备的公钥");
@@ -323,10 +334,14 @@ public final class CloudSyncEngine {
         if (source.isReceiveOnly()) {
             throw new InvalidPayloadException("流体胶囊只接收短信，已忽略它发来的消息");
         }
+        long started = System.nanoTime();
         JSONObject payload = CloudCrypto.decrypt(
                 message.getString("eventId"), currentDeviceId, source.publicKey,
                 message.getJSONObject("envelope"));
+        long decrypted = System.nanoTime();
+        timings.decrypt += decrypted - started;
         processPayload(context, payload, source);
+        timings.apply += System.nanoTime() - decrypted;
     }
 
     /**
@@ -557,11 +572,40 @@ public final class CloudSyncEngine {
         }
     }
 
-    private static void acknowledge(CloudSyncConfig config, long deliveryId) throws Exception {
+    private static void acknowledge(CloudSyncConfig config, long deliveryId, PullTimings timings)
+            throws Exception {
+        long started = System.nanoTime();
         try {
             CloudSyncApi.post(config, "/api/v1/messages/" + deliveryId + "/ack", new JSONObject());
         } catch (CloudSyncApi.ApiException error) {
             if (error.status != 404) throw error;
+        } finally {
+            timings.ack += System.nanoTime() - started;
+        }
+    }
+
+    /** Where a pull spends its time, logged once per pull with counts only (no message data). */
+    static final class PullTimings {
+        int pages;
+        int messages;
+        long state;
+        long list;
+        long decrypt;
+        long apply;
+        long remember;
+        long ack;
+
+        void log(long startedAtMillis) {
+            if (messages == 0) return;
+            Log.i("CapsuleCloudSync", "pull timing n=" + messages + " pages=" + pages
+                    + " totalMs=" + (System.currentTimeMillis() - startedAtMillis)
+                    + " stateMs=" + ms(state) + " listMs=" + ms(list)
+                    + " decryptMs=" + ms(decrypt) + " applyMs=" + ms(apply)
+                    + " rememberMs=" + ms(remember) + " ackMs=" + ms(ack));
+        }
+
+        private static long ms(long nanos) {
+            return nanos / 1_000_000L;
         }
     }
 
