@@ -105,6 +105,7 @@ public final class MainActivity extends Activity {
     private static final String ACTION_MANUAL_VERIFICATION =
             "io.github.venompool888.capsulesms.MANUAL_VERIFICATION";
     private static final int MESSAGE_PAGE_SIZE = 40;
+    private static final long OBSERVER_REFRESH_WINDOW_MS = 250L;
     private static final int OLDER_MESSAGES_TRIGGER_DP = 240;
     private static final String SNAPSHOT_PREFS = "inbox_snapshot";
     private static final String SNAPSHOT_KEY = "conversations";
@@ -159,9 +160,19 @@ public final class MainActivity extends Activity {
     private int hiddenSettingsTapCount;
     private long hiddenSettingsLastTapAt;
     private final OnBackInvokedCallback backCallback = this::handleBack;
-    private final ContentObserver smsObserver = new ContentObserver(new Handler(Looper.getMainLooper())) {
+    private final Handler observerHandler = new Handler(Looper.getMainLooper());
+    private boolean observerRefreshScheduled;
+    private final Runnable observerRefresh = () -> {
+        observerRefreshScheduled = false;
+        refreshInboxFromProvider();
+    };
+    // A sync burst inserts messages one by one and each insert notifies both the SMS and MMS
+    // URIs. Coalesce those into at most one full inbox rescan per window instead of one each.
+    private final ContentObserver smsObserver = new ContentObserver(observerHandler) {
         @Override public void onChange(boolean selfChange, Uri uri) {
-            refreshInboxFromProvider();
+            if (observerRefreshScheduled) return;
+            observerRefreshScheduled = true;
+            observerHandler.postDelayed(observerRefresh, OBSERVER_REFRESH_WINDOW_MS);
         }
     };
 
@@ -282,6 +293,8 @@ public final class MainActivity extends Activity {
         if (smsObserverRegistered) {
             getContentResolver().unregisterContentObserver(smsObserver);
             smsObserverRegistered = false;
+            observerHandler.removeCallbacks(observerRefresh);
+            observerRefreshScheduled = false;
         }
         super.onStop();
     }
