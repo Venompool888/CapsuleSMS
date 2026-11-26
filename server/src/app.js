@@ -25,6 +25,7 @@ import {
 
 const COOKIE_NAME = "capsule_session";
 const MAX_ENVELOPE_BYTES = 64 * 1024;
+const MAX_PENDING_PER_TARGET = 10_000;
 const RECEIVE_ONLY_PLATFORM = "fluidcapsule-android";
 
 export function createApp({ db, config }) {
@@ -40,6 +41,7 @@ export function createApp({ db, config }) {
     maxAge: "1h",
   }));
 
+  const maxPendingPerTarget = config.maxPendingPerTarget ?? MAX_PENDING_PER_TARGET;
   let lastCleanup = 0;
   app.use((_req, _res, next) => {
     if (Date.now() - lastCleanup > 60_000) {
@@ -207,10 +209,17 @@ export function createApp({ db, config }) {
         `).all(req.device.id);
     // A route can be added after the sender fetched its recipients. That device
     // cannot decrypt an envelope until the sender has wrapped a key for it.
-    const targets = envelopeBody.version === 1 && envelopeBody.algorithm === "ECDH-P256+A256GCM"
+    const keyedTargets = envelopeBody.version === 1 && envelopeBody.algorithm === "ECDH-P256+A256GCM"
       ? routedTargets.filter(({ id }) => Object.hasOwn(envelopeBody.wrappedKeys ?? {}, id))
       : routedTargets;
     const now = Date.now();
+    // A device that never comes back (lost phone, wiped app) would otherwise collect a week of
+    // ciphertext without bound. Past the cap it is skipped and left out of acceptedTargets.
+    const pendingFor = db.prepare(`
+      SELECT COUNT(*) AS count FROM message_deliveries
+      WHERE target_device_id = ? AND acknowledged_at IS NULL AND expires_at > ?
+    `);
+    const targets = keyedTargets.filter(({ id }) => pendingFor.get(id, now).count < maxPendingPerTarget);
     const expiresAt = now + config.messageTtlMs;
     const insert = db.prepare(`
       INSERT OR IGNORE INTO message_deliveries
@@ -389,6 +398,8 @@ function revokeDevice(db, deviceId, userId) {
     if (changed.changes) {
       db.prepare("DELETE FROM sync_routes WHERE source_device_id = ? OR target_device_id = ?")
         .run(deviceId, deviceId);
+      // Ciphertext waiting for a revoked device can never be fetched; don't keep it for the TTL.
+      db.prepare("DELETE FROM message_deliveries WHERE target_device_id = ?").run(deviceId);
     }
     db.exec("COMMIT");
     return changed.changes > 0;
