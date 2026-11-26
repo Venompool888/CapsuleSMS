@@ -350,24 +350,39 @@ public final class SmsRepository {
 
     public static Uri saveIncoming(
             Context context, String address, String body, long timestamp, int subscriptionId) {
+        return saveIncoming(context, address, body, timestamp, subscriptionId, true);
+    }
+
+    /** With {@code notify} false the caller calls {@link #notifySmsChanged} once for a batch. */
+    public static Uri saveIncoming(Context context, String address, String body, long timestamp,
+            int subscriptionId, boolean notify) {
         ContentValues values = baseValues(address, body, timestamp);
         values.put("read", 0);
         values.put("seen", 0);
         if (subscriptionId >= 0) values.put("sub_id", subscriptionId);
         Uri saved = context.getContentResolver().insert(Telephony.Sms.Inbox.CONTENT_URI, values);
-        if (saved != null) context.getContentResolver().notifyChange(SMS_URI, null);
+        if (saved != null && notify) notifySmsChanged(context);
         return saved;
     }
 
     public static Uri saveSent(
             Context context, String address, String body, long timestamp, int subscriptionId) {
+        return saveSent(context, address, body, timestamp, subscriptionId, true);
+    }
+
+    public static Uri saveSent(Context context, String address, String body, long timestamp,
+            int subscriptionId, boolean notify) {
         ContentValues values = baseValues(address, body, timestamp);
         values.put("read", 1);
         values.put("seen", 1);
         if (subscriptionId >= 0) values.put("sub_id", subscriptionId);
         Uri saved = context.getContentResolver().insert(Telephony.Sms.Sent.CONTENT_URI, values);
-        if (saved != null) context.getContentResolver().notifyChange(SMS_URI, null);
+        if (saved != null && notify) notifySmsChanged(context);
         return saved;
+    }
+
+    public static void notifySmsChanged(Context context) {
+        context.getContentResolver().notifyChange(SMS_URI, null);
     }
 
     public static long queueOutgoing(
@@ -400,19 +415,23 @@ public final class SmsRepository {
         }
     }
 
-    public static long findMessageId(
-            Context context, String address, String body, long timestamp, int type) {
-        long tolerance = 2_000L;
-        String selection = "address = ? AND body = ? AND type = ? AND date BETWEEN ? AND ?";
-        String[] args = {
-                address, body, Integer.toString(type),
-                Long.toString(Math.max(0L, timestamp - tolerance)),
-                Long.toString(timestamp + tolerance)
-        };
-        try (Cursor cursor = context.getContentResolver().query(
-                SMS_URI, new String[]{"_id"}, selection, args, "date DESC LIMIT 1")) {
-            return cursor != null && cursor.moveToFirst() ? cursor.getLong(0) : -1L;
+    /** Messages with exactly this address and {@code from <= date <= to}, for duplicate checks. */
+    public static void forEachMessage(Context context, String address, long from, long to,
+            MessageRowConsumer consumer) {
+        String selection = "address = ? AND date BETWEEN ? AND ?";
+        String[] args = {address, Long.toString(from), Long.toString(to)};
+        try (Cursor cursor = context.getContentResolver().query(SMS_URI,
+                new String[]{"_id", "body", "type", "date"}, selection, args, null)) {
+            if (cursor == null) return;
+            while (cursor.moveToNext()) {
+                consumer.accept(cursor.getLong(0), cursor.getString(1), cursor.getInt(2),
+                        cursor.getLong(3));
+            }
         }
+    }
+
+    public interface MessageRowConsumer {
+        void accept(long id, String body, int type, long date);
     }
 
     private static ContentValues baseValues(String address, String body, long timestamp) {
