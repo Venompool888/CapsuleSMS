@@ -43,6 +43,9 @@ public final class CloudSyncEngine {
     /** Matches the server's LIMIT on GET /api/v1/messages. */
     static final int PULL_PAGE_SIZE = 100;
     static final int MAX_PULL_PAGES = 10;
+    static final int MAX_PROCESSED = 500;
+    private static final String KIND_SMS = "sms";
+    private static final String KIND_SEND_SMS = "send_sms";
     /** Clock skew allowed between devices; a command dated further ahead can't be trusted to expire. */
     static final long REMOTE_SEND_MAX_FUTURE_MS = 5 * 60 * 1000L;
 
@@ -251,49 +254,68 @@ public final class CloudSyncEngine {
         Map<String, Device> devices = new HashMap<>();
         for (Device device : state.devices) devices.put(device.id, device);
         Set<String> processed = loadProcessed(context);
+        boolean[] processedDirty = {false};
+        IncomingNotificationBatch notifications = new IncomingNotificationBatch();
         int inserted = 0;
         RetryLaterException deferred = null;
         long cursor = 0;
-        // The server returns at most 100 deliveries per page. Follow the cursor so a backlog
-        // (or a run of deliveries left pending for retry) can't hide the messages behind it.
-        for (int page = 0; page < MAX_PULL_PAGES; page++) {
-            phase = System.nanoTime();
-            JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=" + cursor);
-            timings.list += System.nanoTime() - phase;
-            timings.pages++;
-            JSONArray messages = response.optJSONArray("messages");
-            if (messages == null || messages.length() == 0) break;
-            for (int i = 0; i < messages.length(); i++) {
-                JSONObject message = messages.getJSONObject(i);
-                long deliveryId = message.getLong("deliveryId");
-                String eventId = message.getString("eventId");
-                timings.messages++;
-                if (processed.contains(eventId)) {
-                    acknowledge(config, deliveryId, timings);
-                    continue;
-                }
-                try {
-                    if (completeDelivery(
-                            () -> applyDelivery(context, state.currentDeviceId, devices, message, timings),
-                            reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
-                            () -> {
-                                long remembered = System.nanoTime();
-                                rememberProcessed(context, processed, eventId);
-                                timings.remember += System.nanoTime() - remembered;
-                                acknowledge(config, deliveryId, timings);
-                            })) {
-                        inserted++;
+        try {
+            // The server returns at most 100 deliveries per page. Follow the cursor so a backlog
+            // (or a run of deliveries left pending for retry) can't hide the messages behind it.
+            for (int page = 0; page < MAX_PULL_PAGES; page++) {
+                phase = System.nanoTime();
+                JSONObject response = CloudSyncApi.get(config, "/api/v1/messages?after=" + cursor);
+                timings.list += System.nanoTime() - phase;
+                timings.pages++;
+                JSONArray messages = response.optJSONArray("messages");
+                if (messages == null || messages.length() == 0) break;
+                for (int i = 0; i < messages.length(); i++) {
+                    JSONObject message = messages.getJSONObject(i);
+                    long deliveryId = message.getLong("deliveryId");
+                    String eventId = message.getString("eventId");
+                    timings.messages++;
+                    if (processed.contains(eventId)) {
+                        acknowledge(config, deliveryId, timings);
+                        continue;
                     }
-                } catch (RetryLaterException error) {
-                    // Leave it unacknowledged for the next pull, but keep going so later
-                    // messages are not stuck behind it.
-                    config.recordError(CloudSyncConfig.PULL, "同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
-                    deferred = error;
+                    String[] kind = {null};
+                    try {
+                        if (completeDelivery(
+                                () -> kind[0] = applyDelivery(
+                                        context, state.currentDeviceId, devices, message, notifications, timings),
+                                reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
+                                () -> {
+                                    long remembered = System.nanoTime();
+                                    addProcessed(processed, eventId);
+                                    if (KIND_SEND_SMS.equals(kind[0])) {
+                                        // A replayed send command would send the SMS twice: persist
+                                        // before acknowledging. Inserted SMS are also de-duplicated
+                                        // against the SMS provider, so those can be saved per page.
+                                        saveProcessed(context, processed);
+                                    } else {
+                                        processedDirty[0] = true;
+                                    }
+                                    timings.remember += System.nanoTime() - remembered;
+                                    acknowledge(config, deliveryId, timings);
+                                })) {
+                            inserted++;
+                        }
+                    } catch (RetryLaterException error) {
+                        // Leave it unacknowledged for the next pull, but keep going so later
+                        // messages are not stuck behind it.
+                        config.recordError(CloudSyncConfig.PULL, "同步消息 #" + deliveryId + " 稍后重试：" + error.getMessage());
+                        deferred = error;
+                    }
                 }
+                flushProcessed(context, processed, processedDirty, timings);
+                long next = response.optLong("nextCursor", cursor);
+                if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
+                cursor = next;
             }
-            long next = response.optLong("nextCursor", cursor);
-            if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
-            cursor = next;
+        } finally {
+            // Also on failure: what was inserted before the error still gets its notification.
+            flushProcessed(context, processed, processedDirty, timings);
+            postNotifications(context, notifications);
         }
         timings.log(startedAt);
         // Fail the pull after the rest went through, so callers back off instead of
@@ -324,9 +346,10 @@ public final class CloudSyncEngine {
         return applied;
     }
 
-    private static void applyDelivery(
+    /** Applies one delivery and returns its payload kind. */
+    private static String applyDelivery(
             Context context, String currentDeviceId, Map<String, Device> devices, JSONObject message,
-            PullTimings timings) throws Exception {
+            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
         Device source = devices.get(message.getString("sourceDeviceId"));
         if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
             throw new CloudCrypto.InvalidEnvelopeException("找不到发送设备的公钥");
@@ -340,8 +363,9 @@ public final class CloudSyncEngine {
                 message.getJSONObject("envelope"));
         long decrypted = System.nanoTime();
         timings.decrypt += decrypted - started;
-        processPayload(context, payload, source);
+        String kind = processPayload(context, payload, source, notifications);
         timings.apply += System.nanoTime() - decrypted;
+        return kind;
     }
 
     /**
@@ -434,16 +458,16 @@ public final class CloudSyncEngine {
         return true;
     }
 
-    private static void processPayload(Context context, JSONObject payload, Device source)
-            throws Exception {
+    private static String processPayload(Context context, JSONObject payload, Device source,
+            IncomingNotificationBatch notifications) throws Exception {
         String kind = payload.optString("kind");
-        if ("sms".equals(kind)) {
-            insertPayload(context, payload, source);
-            return;
+        if (KIND_SMS.equals(kind)) {
+            insertPayload(context, payload, source, notifications);
+            return kind;
         }
-        if ("send_sms".equals(kind)) {
+        if (KIND_SEND_SMS.equals(kind)) {
             executeRemoteSend(context, payload);
-            return;
+            return kind;
         }
         throw new InvalidPayloadException("不支持的同步消息类型");
     }
@@ -473,8 +497,8 @@ public final class CloudSyncEngine {
                 || requestedAt - now > REMOTE_SEND_MAX_FUTURE_MS;
     }
 
-    private static void insertPayload(
-            Context context, JSONObject payload, Device source) throws Exception {
+    private static void insertPayload(Context context, JSONObject payload, Device source,
+            IncomingNotificationBatch notifications) throws Exception {
         String address = payload.getString("address");
         String body = payload.getString("body");
         long timestamp = payload.getLong("timestamp");
@@ -504,7 +528,7 @@ public final class CloudSyncEngine {
         // Checked before notifying, so a retried delivery doesn't notify twice.
         if (saved == null) throw new RetryLaterException("无法写入系统短信库");
         if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) {
-            SmsDeliverReceiver.notifyIncoming(context, address, body, origin.displayLabel());
+            notifications.add(address, body, origin.displayLabel());
         }
         new CloudMessageOriginStore(context).put(ContentUris.parseId(saved), origin);
     }
@@ -650,12 +674,31 @@ public final class CloudSyncEngine {
         return result;
     }
 
-    private static void rememberProcessed(Context context, Set<String> processed, String eventId) {
+    static void addProcessed(Set<String> processed, String eventId) {
+        processed.remove(eventId);
         processed.add(eventId);
-        while (processed.size() > 500) {
+        while (processed.size() > MAX_PROCESSED) {
             String first = processed.iterator().next();
             processed.remove(first);
         }
+    }
+
+    private static void flushProcessed(Context context, Set<String> processed, boolean[] dirty,
+            PullTimings timings) {
+        if (!dirty[0]) return;
+        long started = System.nanoTime();
+        saveProcessed(context, processed);
+        dirty[0] = false;
+        timings.remember += System.nanoTime() - started;
+    }
+
+    private static void postNotifications(Context context, IncomingNotificationBatch notifications) {
+        for (IncomingNotificationBatch.Entry entry : notifications.drain()) {
+            SmsDeliverReceiver.notifyIncoming(context, entry.address, entry.body, entry.label);
+        }
+    }
+
+    private static void saveProcessed(Context context, Set<String> processed) {
         JSONArray values = new JSONArray();
         for (String value : processed) values.put(value);
         SharedPreferences prefs = context.getSharedPreferences(PROCESSED_PREFS, Context.MODE_PRIVATE);
