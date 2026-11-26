@@ -24,15 +24,28 @@ export function adminPage(user, users, message = "") {
   return shell("用户管理", `<div class="title-row"><div><h1>用户管理</h1><p class="muted">创建账号、停用账号并查看设备数量。</p></div></div>${message ? `<div class="alert success">${escapeHtml(message)}</div>` : ""}<section class="card"><h2>新增用户</h2><form class="inline-form" method="post" action="/admin/users"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><label>用户名<input name="username" required placeholder="yuri"></label><label>初始密码<input type="password" name="password" minlength="12" required></label><button type="submit">创建</button></form></section><section class="card"><table><thead><tr><th>用户名</th><th>角色</th><th>设备</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>`, user);
 }
 
+const RECEIVE_ONLY_PLATFORM = "fluidcapsule-android";
+
 export function portalPage(user, devices, routes, message = "") {
   const routeSet = new Set(routes.map((route) => `${route.source_device_id}:${route.target_device_id}`));
-  const cards = devices.map((device) => {
-    const others = devices.filter((other) => other.id !== device.id && other.enabled);
+  const active = devices.filter((device) => device.enabled);
+  const revoked = devices.filter((device) => !device.enabled);
+  const cards = active.map((device) => {
+    const others = active.filter((other) => other.id !== device.id);
+    // The server ignores routes that start at a receive-only device, so don't offer them.
+    const senders = others.filter((other) => !isReceiveOnly(other));
     const push = others.map((other) => checkbox("pushTo", other, routeSet.has(`${device.id}:${other.id}`))).join("");
-    const receive = others.map((other) => checkbox("receiveFrom", other, routeSet.has(`${other.id}:${device.id}`))).join("");
-    return `<section class="card device"><div class="title-row"><div><h2>${escapeHtml(device.name)}</h2><p class="muted">${escapeHtml(device.platform)} · ${device.enabled ? "已连接" : "已撤销"}${device.last_seen_at ? ` · 最后在线 ${new Date(device.last_seen_at).toLocaleString("zh-CN")}` : ""}</p></div>${device.enabled ? `<form method="post" action="/portal/devices/${device.id}/revoke"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><button class="danger">撤销</button></form>` : ""}</div>${device.enabled ? `<form method="post" action="/portal/routes"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><input type="hidden" name="deviceId" value="${device.id}"><div class="route-grid"><fieldset><legend>推送短信到</legend>${push || `<p class="muted">暂无其他设备</p>`}</fieldset><fieldset><legend>接收来自</legend>${receive || `<p class="muted">暂无其他设备</p>`}</fieldset></div><button type="submit">保存同步设置</button></form>` : ""}</section>`;
+    const receive = senders.map((other) => checkbox("receiveFrom", other, routeSet.has(`${other.id}:${device.id}`))).join("");
+    const pushField = isReceiveOnly(device)
+      ? `<fieldset><legend>推送短信到</legend><p class="muted">这台设备只接收短信，不会向其他设备推送。</p></fieldset>`
+      : `<fieldset><legend>推送短信到</legend>${push || `<p class="muted">暂无其他设备</p>`}</fieldset>`;
+    return `<section class="card device"><div class="title-row"><div><h2>${escapeHtml(device.name)}</h2><p class="muted">${escapeHtml(platformLabel(device.platform))} · 已连接${lastSeen(device)}</p></div><details class="confirm"><summary class="button danger">撤销</summary><form method="post" action="/portal/devices/${device.id}/revoke"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><p>撤销后这台设备会立即断开，同步关系一并删除。重新连接需要新的注册码。</p><button class="danger">确认撤销</button></form></details></div><form method="post" action="/portal/routes"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><input type="hidden" name="deviceId" value="${device.id}"><div class="route-grid">${pushField}<fieldset><legend>接收来自</legend>${receive || `<p class="muted">暂无可推送的设备</p>`}</fieldset></div><button type="submit">保存同步设置</button></form></section>`;
   }).join("");
-  return shell("设备与同步", `<div class="title-row"><div><h1>设备与同步</h1><p class="muted">任意一端修改推送关系，另一端的接收关系会自动同步。</p></div><form method="post" action="/portal/enrollments"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><button>添加设备</button></form></div>${message ? `<div class="alert success">${escapeHtml(message)}</div>` : ""}${cards || `<section class="empty"><h2>还没有设备</h2><p>点击“添加设备”生成二维码或手动注册码。</p></section>`}`, user);
+  const revokedList = revoked.length
+    ? `<details class="card revoked"><summary>已撤销的设备（${revoked.length}）</summary><ul>${revoked.map((device) => `<li><span>${escapeHtml(device.name)}</span><span class="muted">${escapeHtml(platformLabel(device.platform))}${lastSeen(device)}</span></li>`).join("")}</ul></details>`
+    : "";
+  const empty = `<section class="empty"><h2>还没有设备</h2><p>点击“添加设备”生成二维码或手动注册码。</p></section>`;
+  return shell("设备与同步", `<div class="title-row"><div><h1>设备与同步</h1><p class="muted">任意一端修改推送关系，另一端的接收关系会自动同步。</p></div><form method="post" action="/portal/enrollments"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><button>添加设备</button></form></div>${message ? `<div class="alert success">${escapeHtml(message)}</div>` : ""}${cards || empty}${revokedList}`, user);
 }
 
 export function enrollmentPage(user, enrollment, qrSvg, baseUrl) {
@@ -40,5 +53,20 @@ export function enrollmentPage(user, enrollment, qrSvg, baseUrl) {
 }
 
 function checkbox(name, device, checked) {
-  return `<label class="check"><input type="checkbox" name="${name}" value="${device.id}" ${checked ? "checked" : ""}><span>${escapeHtml(device.name)}<small>${escapeHtml(device.platform)}</small></span></label>`;
+  return `<label class="check"><input type="checkbox" name="${name}" value="${device.id}" ${checked ? "checked" : ""}><span>${escapeHtml(device.name)}<small>${escapeHtml(platformLabel(device.platform))}</small></span></label>`;
+}
+
+function isReceiveOnly(device) {
+  return device.platform === RECEIVE_ONLY_PLATFORM;
+}
+
+export function platformLabel(platform) {
+  if (platform === RECEIVE_ONLY_PLATFORM) return "FluidCapsule · 仅接收";
+  const android = /^android-(.+)$/.exec(platform ?? "");
+  if (android) return `Android ${android[1]}`;
+  return platform ?? "";
+}
+
+function lastSeen(device) {
+  return device.last_seen_at ? ` · 最后在线 ${new Date(device.last_seen_at).toLocaleString("zh-CN")}` : "";
 }
