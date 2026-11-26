@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { hashPassword, normalizeUsername, randomToken, tokenHash } from "./security.js";
+import { hashPassword, normalizeUsername, randomToken, tokenHash, userError } from "./security.js";
 
 export function openDatabase(path) {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -86,10 +86,15 @@ export async function ensureAdmin(db, username, password) {
 
 export async function createUser(db, { username, password, role = "user" }) {
   const id = randomUUID();
-  db.prepare(`
-    INSERT INTO users (id, username, password_hash, role, enabled, created_at)
-    VALUES (?, ?, ?, ?, 1, ?)
-  `).run(id, normalizeUsername(username), await hashPassword(password), role, Date.now());
+  try {
+    db.prepare(`
+      INSERT INTO users (id, username, password_hash, role, enabled, created_at)
+      VALUES (?, ?, ?, ?, 1, ?)
+    `).run(id, normalizeUsername(username), await hashPassword(password), role, Date.now());
+  } catch (error) {
+    if (/UNIQUE constraint failed: users\.username/.test(error.message)) throw userError("这个用户名已被使用");
+    throw error;
+  }
   return id;
 }
 
@@ -154,7 +159,7 @@ export function replaceRoutes(db, userId, deviceId, pushTo, receiveFrom) {
   const allowed = new Set(devices.map(({ id }) => id));
   const sources = new Set(devices.filter(({ platform }) => platform !== "fluidcapsule-android")
     .map(({ id }) => id));
-  if (!allowed.has(deviceId)) throw new Error("设备不存在或已停用");
+  if (!allowed.has(deviceId)) throw userError("设备不存在或已停用");
   const outgoing = sources.has(deviceId) ? uniqueDeviceIds(pushTo, allowed, deviceId) : [];
   const incoming = uniqueDeviceIds(receiveFrom, sources, deviceId);
   const now = Date.now();
@@ -189,20 +194,20 @@ function uniqueDeviceIds(values, allowed, self) {
 
 function cleanDeviceName(value) {
   const name = String(value ?? "").trim();
-  if (name.length < 1 || name.length > 64) throw new Error("设备名称长度必须为 1–64 个字符");
+  if (name.length < 1 || name.length > 64) throw userError("设备名称长度必须为 1–64 个字符");
   return name;
 }
 
 function cleanPlatform(value) {
   const platform = String(value ?? "android").trim().toLowerCase();
-  if (!/^[a-z0-9._-]{1,32}$/.test(platform)) throw new Error("设备平台格式无效");
+  if (!/^[a-z0-9._-]{1,32}$/.test(platform)) throw userError("设备平台格式无效");
   return platform;
 }
 
 function cleanPublicKey(value) {
   if (value == null || value === "") return null;
   const key = String(value);
-  if (key.length > 4096) throw new Error("设备公钥过长");
+  if (key.length > 4096) throw userError("设备公钥过长");
   return key;
 }
 
