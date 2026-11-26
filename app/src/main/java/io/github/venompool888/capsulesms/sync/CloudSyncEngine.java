@@ -377,7 +377,7 @@ public final class CloudSyncEngine {
                 message.getJSONObject("envelope"));
         long decrypted = System.nanoTime();
         timings.decrypt += decrypted - started;
-        String kind = processPayload(context, payload, source, notifications);
+        String kind = processPayload(context, payload, source, notifications, timings);
         timings.apply += System.nanoTime() - decrypted;
         return kind;
     }
@@ -473,10 +473,10 @@ public final class CloudSyncEngine {
     }
 
     private static String processPayload(Context context, JSONObject payload, Device source,
-            IncomingNotificationBatch notifications) throws Exception {
+            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
         String kind = payload.optString("kind");
         if (KIND_SMS.equals(kind)) {
-            insertPayload(context, payload, source, notifications);
+            insertPayload(context, payload, source, notifications, timings);
             return kind;
         }
         if (KIND_SEND_SMS.equals(kind)) {
@@ -512,7 +512,7 @@ public final class CloudSyncEngine {
     }
 
     private static void insertPayload(Context context, JSONObject payload, Device source,
-            IncomingNotificationBatch notifications) throws Exception {
+            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
         String address = payload.getString("address");
         String body = payload.getString("body");
         long timestamp = payload.getLong("timestamp");
@@ -525,11 +525,16 @@ public final class CloudSyncEngine {
                 && type != Telephony.Sms.MESSAGE_TYPE_SENT)) {
             throw new InvalidPayloadException("同步短信内容无效");
         }
+        long phase = System.nanoTime();
         long existingId = SmsRepository.findMessageId(context, address, body, timestamp, type);
+        timings.findDuplicate += System.nanoTime() - phase;
         if (existingId >= 0) {
+            phase = System.nanoTime();
             new CloudMessageOriginStore(context).put(existingId, origin);
+            timings.origin += System.nanoTime() - phase;
             return;
         }
+        phase = System.nanoTime();
         Uri saved;
         // Subscription IDs belong to the source phone and are not portable. Passing an
         // OPPO SIM ID to Pixel can make the target SmsProvider reject the insert.
@@ -539,12 +544,15 @@ public final class CloudSyncEngine {
         } else {
             saved = SmsRepository.saveIncoming(context, address, body, timestamp, targetSubscriptionId);
         }
+        timings.insert += System.nanoTime() - phase;
         // Checked before notifying, so a retried delivery doesn't notify twice.
         if (saved == null) throw new RetryLaterException("无法写入系统短信库");
         if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) {
             notifications.add(address, body, origin.displayLabel());
         }
+        phase = System.nanoTime();
         new CloudMessageOriginStore(context).put(ContentUris.parseId(saved), origin);
+        timings.origin += System.nanoTime() - phase;
     }
 
     private static LineIdentity resolveLineIdentity(Context context, int subscriptionId) {
@@ -660,6 +668,10 @@ public final class CloudSyncEngine {
         long list;
         long decrypt;
         long apply;
+        // Parts of apply, for SMS payloads.
+        long findDuplicate;
+        long insert;
+        long origin;
         long remember;
         long ack;
         int ackRequests;
@@ -670,6 +682,8 @@ public final class CloudSyncEngine {
                     + " totalMs=" + (System.currentTimeMillis() - startedAtMillis)
                     + " stateMs=" + ms(state) + " listMs=" + ms(list)
                     + " decryptMs=" + ms(decrypt) + " applyMs=" + ms(apply)
+                    + " (findMs=" + ms(findDuplicate) + " insertMs=" + ms(insert)
+                    + " originMs=" + ms(origin) + ")"
                     + " rememberMs=" + ms(remember) + " ackMs=" + ms(ack)
                     + " ackRequests=" + ackRequests);
         }
