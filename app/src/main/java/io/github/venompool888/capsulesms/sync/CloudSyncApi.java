@@ -1,5 +1,6 @@
 package io.github.venompool888.capsulesms.sync;
 
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -146,8 +147,16 @@ final class CloudSyncApi {
         InputStream stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
         String response = read(stream);
         connection.disconnect();
-        JSONObject json = response.isBlank() ? new JSONObject() : new JSONObject(response);
-        if (status < 200 || status >= 300) {
+        boolean ok = status >= 200 && status < 300;
+        JSONObject json;
+        try {
+            json = response.isBlank() ? new JSONObject() : new JSONObject(response);
+        } catch (JSONException notJson) {
+            // An error page (proxy, or an older server's HTML 404) still has a usable status.
+            if (ok) throw notJson;
+            json = new JSONObject();
+        }
+        if (!ok) {
             String message = json.optString("message", "服务器返回 " + status);
             throw new ApiException(status, json.optString("error"), message);
         }

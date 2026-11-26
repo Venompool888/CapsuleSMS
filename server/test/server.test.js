@@ -292,6 +292,50 @@ test("a target that never collects stops accepting new deliveries past the cap",
   }
 });
 
+test("a page of deliveries can be acknowledged in one request", async () => {
+  const credentials = { username: "sync-user", password: "correct-horse-battery-staple" };
+  const sender = await connect({ ...credentials, deviceName: "Batch sender" });
+  const receiver = await connect({ ...credentials, deviceName: "Batch receiver" });
+  const bystander = await connect({ ...credentials, deviceName: "Bystander" });
+  await api(sender.deviceToken, "/api/v1/sync-routes", {
+    method: "PUT", body: { pushTo: [receiver.deviceId], receiveFrom: [] },
+  });
+  for (let i = 1; i <= 3; i++) {
+    await api(sender.deviceToken, "/api/v1/messages", {
+      method: "POST", expectedStatus: 202,
+      body: { eventId: `${sender.deviceId}:batch-000${i}`,
+        envelope: { algorithm: "test-only", ciphertext: `m${i}` } },
+    });
+  }
+  const ids = (await api(receiver.deviceToken, "/api/v1/messages")).messages.map((m) => m.deliveryId);
+  assert.equal(ids.length, 3);
+
+  const foreign = await api(bystander.deviceToken, "/api/v1/messages/ack", {
+    method: "POST", body: { deliveryIds: ids },
+  });
+  assert.equal(foreign.acknowledged, 0);
+
+  const first = await api(receiver.deviceToken, "/api/v1/messages/ack", {
+    method: "POST", body: { deliveryIds: [ids[0], ids[1], ids[1], 987654321] },
+  });
+  assert.equal(first.acknowledged, 2);
+  const again = await api(receiver.deviceToken, "/api/v1/messages/ack", {
+    method: "POST", body: { deliveryIds: [ids[0]] },
+  });
+  assert.equal(again.acknowledged, 0);
+  assert.deepEqual(
+    (await api(receiver.deviceToken, "/api/v1/messages")).messages.map((m) => m.deliveryId),
+    [ids[2]],
+  );
+
+  for (const deliveryIds of [[], ["1"], [0], new Array(501).fill(1), undefined]) {
+    const rejected = await api(receiver.deviceToken, "/api/v1/messages/ack", {
+      method: "POST", body: { deliveryIds }, expectedStatus: 400,
+    });
+    assert.equal(rejected.error, "invalid_ack");
+  }
+});
+
 test("web pages show notices by code only, never text from the link", async () => {
   const session = await webLogin();
   const crafted = await session.get("/portal?message=" + encodeURIComponent("请访问 evil.example") + "&notice=nope");

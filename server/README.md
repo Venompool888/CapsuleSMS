@@ -117,6 +117,7 @@ Authorization: Bearer <deviceToken>
 | `GET` | `/api/v1/messages?after=0` | 按游标拉取本设备的待收消息 |
 | `GET` | `/api/v1/messages/wait?timeout=25` | 等待待收消息，新增投递时立即唤醒 |
 | `POST` | `/api/v1/messages/:id/ack` | 确认并清空服务器密文 |
+| `POST` | `/api/v1/messages/ack` | 批量确认（`{"deliveryIds":[…]}`，最多 500 个），返回 `{"acknowledged":n}` |
 
 消息上传示例：
 
