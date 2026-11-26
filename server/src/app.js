@@ -27,6 +27,7 @@ import {
 
 const COOKIE_NAME = "capsule_session";
 const MAX_ENVELOPE_BYTES = 64 * 1024;
+const MAX_ACK_BATCH = 500;
 const MAX_PENDING_PER_TARGET = 10_000;
 const RECEIVE_ONLY_PLATFORM = "fluidcapsule-android";
 
@@ -291,6 +292,30 @@ export function createApp({ db, config }) {
       })),
       nextCursor: rows.length ? rows.at(-1).id : after,
     });
+  });
+  // Acknowledge a page of deliveries in one request. Ids that are unknown, already
+  // acknowledged or meant for another device are skipped, so a retry is harmless.
+  app.post("/api/v1/messages/ack", (req, res) => {
+    const ids = req.body?.deliveryIds;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_ACK_BATCH
+        || !ids.every((id) => Number.isSafeInteger(id) && id > 0)) {
+      return jsonError(res, 400, "invalid_ack", `deliveryIds 必须是 1–${MAX_ACK_BATCH} 个正整数`);
+    }
+    const acknowledge = db.prepare(`
+      UPDATE message_deliveries SET acknowledged_at = ?, envelope = 'null'
+      WHERE id = ? AND target_device_id = ? AND acknowledged_at IS NULL
+    `);
+    const now = Date.now();
+    let acknowledged = 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const id of new Set(ids)) acknowledged += acknowledge.run(now, id, req.device.id).changes;
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    res.json({ acknowledged });
   });
   app.post("/api/v1/messages/:id/ack", (req, res) => {
     const result = db.prepare(`

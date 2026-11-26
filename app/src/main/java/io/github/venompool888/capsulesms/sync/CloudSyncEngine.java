@@ -255,6 +255,7 @@ public final class CloudSyncEngine {
         for (Device device : state.devices) devices.put(device.id, device);
         Set<String> processed = loadProcessed(context);
         boolean[] processedDirty = {false};
+        List<Long> pendingAcks = new ArrayList<>();
         IncomingNotificationBatch notifications = new IncomingNotificationBatch();
         int inserted = 0;
         RetryLaterException deferred = null;
@@ -275,7 +276,7 @@ public final class CloudSyncEngine {
                     String eventId = message.getString("eventId");
                     timings.messages++;
                     if (processed.contains(eventId)) {
-                        acknowledge(config, deliveryId, timings);
+                        pendingAcks.add(deliveryId);
                         continue;
                     }
                     String[] kind = {null};
@@ -289,14 +290,16 @@ public final class CloudSyncEngine {
                                     addProcessed(processed, eventId);
                                     if (KIND_SEND_SMS.equals(kind[0])) {
                                         // A replayed send command would send the SMS twice: persist
-                                        // before acknowledging. Inserted SMS are also de-duplicated
-                                        // against the SMS provider, so those can be saved per page.
+                                        // and acknowledge it now. Inserted SMS are also de-duplicated
+                                        // against the SMS provider, so those are settled per page.
                                         saveProcessed(context, processed);
+                                        timings.remember += System.nanoTime() - remembered;
+                                        acknowledge(config, deliveryId, timings);
                                     } else {
                                         processedDirty[0] = true;
+                                        pendingAcks.add(deliveryId);
+                                        timings.remember += System.nanoTime() - remembered;
                                     }
-                                    timings.remember += System.nanoTime() - remembered;
-                                    acknowledge(config, deliveryId, timings);
                                 })) {
                             inserted++;
                         }
@@ -307,7 +310,10 @@ public final class CloudSyncEngine {
                         deferred = error;
                     }
                 }
+                // Save the de-duplication list before acknowledging, so anything the server
+                // still redelivers is recognised.
                 flushProcessed(context, processed, processedDirty, timings);
+                acknowledgeAll(config, pendingAcks, timings);
                 long next = response.optLong("nextCursor", cursor);
                 if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
                 cursor = next;
@@ -315,6 +321,11 @@ public final class CloudSyncEngine {
         } finally {
             // Also on failure: what was inserted before the error still gets its notification.
             flushProcessed(context, processed, processedDirty, timings);
+            try {
+                acknowledgeAll(config, pendingAcks, timings);
+            } catch (Exception ignored) {
+                // Left pending on the server; the next pull recognises and acknowledges them.
+            }
             postNotifications(context, notifications);
         }
         timings.log(startedAt);
@@ -605,6 +616,36 @@ public final class CloudSyncEngine {
             if (error.status != 404) throw error;
         } finally {
             timings.ack += System.nanoTime() - started;
+            timings.ackRequests++;
+        }
+    }
+
+    /** Whether the server has the batch ack route; servers before it answer 404. */
+    private static volatile boolean batchAckUnsupported = false;
+
+    static final int MAX_ACK_BATCH = 500;
+
+    private static void acknowledgeAll(CloudSyncConfig config, List<Long> deliveryIds,
+            PullTimings timings) throws Exception {
+        while (!deliveryIds.isEmpty()) {
+            if (batchAckUnsupported) {
+                acknowledge(config, deliveryIds.get(0), timings);
+                deliveryIds.remove(0);
+                continue;
+            }
+            List<Long> batch = deliveryIds.subList(0, Math.min(MAX_ACK_BATCH, deliveryIds.size()));
+            long started = System.nanoTime();
+            try {
+                CloudSyncApi.post(config, "/api/v1/messages/ack",
+                        new JSONObject().put("deliveryIds", new JSONArray(batch)));
+                timings.ackRequests++;
+                batch.clear();
+            } catch (CloudSyncApi.ApiException error) {
+                if (error.status != 404 && error.status != 405) throw error;
+                batchAckUnsupported = true;
+            } finally {
+                timings.ack += System.nanoTime() - started;
+            }
         }
     }
 
@@ -618,6 +659,7 @@ public final class CloudSyncEngine {
         long apply;
         long remember;
         long ack;
+        int ackRequests;
 
         void log(long startedAtMillis) {
             if (messages == 0) return;
@@ -625,7 +667,8 @@ public final class CloudSyncEngine {
                     + " totalMs=" + (System.currentTimeMillis() - startedAtMillis)
                     + " stateMs=" + ms(state) + " listMs=" + ms(list)
                     + " decryptMs=" + ms(decrypt) + " applyMs=" + ms(apply)
-                    + " rememberMs=" + ms(remember) + " ackMs=" + ms(ack));
+                    + " rememberMs=" + ms(remember) + " ackMs=" + ms(ack)
+                    + " ackRequests=" + ackRequests);
         }
 
         private static long ms(long nanos) {
