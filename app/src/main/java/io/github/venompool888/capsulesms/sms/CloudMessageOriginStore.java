@@ -8,6 +8,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 /** Local presentation metadata for SMS rows received through cloud sync. */
 public final class CloudMessageOriginStore {
@@ -106,9 +107,11 @@ public final class CloudMessageOriginStore {
     }
 
     private void pruneIfNeeded() {
-        if (preferences.getAll().size() <= MAX_ENTRIES) return;
+        // getAll() copies the whole map, so take it once.
+        Map<String, ?> all = preferences.getAll();
+        if (all.size() <= MAX_ENTRIES) return;
         List<Long> ids = new ArrayList<>();
-        for (String key : preferences.getAll().keySet()) {
+        for (String key : all.keySet()) {
             try { ids.add(Long.parseLong(key)); } catch (NumberFormatException ignored) {}
         }
         ids.sort(Comparator.naturalOrder());
