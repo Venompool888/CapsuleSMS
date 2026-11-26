@@ -20,7 +20,10 @@ import java.security.SecureRandom;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
@@ -61,12 +64,18 @@ final class CloudCrypto {
                 payload.toString().getBytes(StandardCharsets.UTF_8));
 
         JSONObject wrappedKeys = new JSONObject();
+        PrivateKey ownPrivate = keyPair().getPrivate();
         for (CloudSyncEngine.Device target : targets) {
             if (target.publicKey == null || target.publicKey.isBlank()) {
                 throw new IllegalStateException("设备“" + target.name + "”没有加密公钥，请重新连接该设备");
             }
-            SecretKey wrappingKey = deriveWrappingKey(
-                    keyPair().getPrivate(), decodePublicKey(target.publicKey), eventId, target.id);
+            byte[] shared = agree(ownPrivate, decodePublicKey(target.publicKey));
+            SecretKey wrappingKey;
+            try {
+                wrappingKey = wrappingKey(shared, eventId, target.id);
+            } finally {
+                Arrays.fill(shared, (byte) 0);
+            }
             byte[] wrapIv = randomIv();
             byte[] wrapped = aesGcm(
                     Cipher.ENCRYPT_MODE, wrappingKey, wrapIv,
@@ -88,8 +97,34 @@ final class CloudCrypto {
                 .put("wrappedKeys", wrappedKeys);
     }
 
+    /**
+     * Key material for one batch of decryptions, such as one pull. Loading the Keystore key and
+     * running ECDH in it cost tens of milliseconds per message; within a session both happen once
+     * per sending device. The shared secrets are wiped on close and never outlive the session.
+     */
+    static final class Session implements AutoCloseable {
+        private PrivateKey ownPrivate;
+        private final Map<String, byte[]> sharedBySenderKey = new HashMap<>();
+
+        byte[] sharedSecret(String senderKey) throws Exception {
+            byte[] cached = sharedBySenderKey.get(senderKey);
+            if (cached != null) return cached;
+            if (ownPrivate == null) ownPrivate = keyPair().getPrivate();
+            byte[] shared = agree(ownPrivate, decodePublicKey(senderKey));
+            sharedBySenderKey.put(senderKey, shared);
+            return shared;
+        }
+
+        @Override
+        public void close() {
+            for (byte[] shared : sharedBySenderKey.values()) Arrays.fill(shared, (byte) 0);
+            sharedBySenderKey.clear();
+            ownPrivate = null;
+        }
+    }
+
     static JSONObject decrypt(
-            String eventId, String currentDeviceId, String registeredSourceKey,
+            Session session, String eventId, String currentDeviceId, String registeredSourceKey,
             JSONObject envelope) throws Exception {
         if (envelope.optInt("version") != 1
                 || !"ECDH-P256+A256GCM".equals(envelope.optString("algorithm"))) {
@@ -100,10 +135,9 @@ final class CloudCrypto {
             throw new InvalidEnvelopeException("发送设备公钥与服务器记录不一致");
         }
         JSONObject wrapped = envelope.getJSONObject("wrappedKeys").getJSONObject(currentDeviceId);
-        PrivateKey ownPrivate = keyPair().getPrivate();
         try {
-            SecretKey wrappingKey = deriveWrappingKey(
-                    ownPrivate, decodePublicKey(senderKey), eventId, currentDeviceId);
+            SecretKey wrappingKey = wrappingKey(
+                    session.sharedSecret(senderKey), eventId, currentDeviceId);
             byte[] contentKeyBytes = aesGcm(
                     Cipher.DECRYPT_MODE, wrappingKey, decode(wrapped.getString("iv")),
                     (eventId + "\n" + currentDeviceId).getBytes(StandardCharsets.UTF_8),
@@ -131,8 +165,7 @@ final class CloudCrypto {
         }
     }
 
-    private static SecretKey deriveWrappingKey(
-            PrivateKey ownPrivate, PublicKey otherPublic, String eventId, String targetId) throws Exception {
+    private static byte[] agree(PrivateKey ownPrivate, PublicKey otherPublic) throws Exception {
         KeyAgreement agreement = KeyAgreement.getInstance("ECDH");
         agreement.init(ownPrivate);
         try {
@@ -140,7 +173,11 @@ final class CloudCrypto {
         } catch (InvalidKeyException error) {
             throw new InvalidKeySpecException("设备公钥无法用于密钥协商", error);
         }
-        byte[] shared = agreement.generateSecret();
+        return agreement.generateSecret();
+    }
+
+    /** Per-event wrapping key; the protocol's derivation, unchanged. */
+    static SecretKey wrappingKey(byte[] shared, String eventId, String targetId) throws Exception {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         digest.update("capsule-wrap-v1\n".getBytes(StandardCharsets.UTF_8));
         digest.update(shared);

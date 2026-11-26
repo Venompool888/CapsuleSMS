@@ -256,6 +256,7 @@ public final class CloudSyncEngine {
         Set<String> processed = loadProcessed(context);
         boolean[] processedDirty = {false};
         List<Long> pendingAcks = new ArrayList<>();
+        CloudCrypto.Session keys = new CloudCrypto.Session();
         IncomingNotificationBatch notifications = new IncomingNotificationBatch();
         int inserted = 0;
         RetryLaterException deferred = null;
@@ -283,7 +284,8 @@ public final class CloudSyncEngine {
                     try {
                         if (completeDelivery(
                                 () -> kind[0] = applyDelivery(
-                                        context, state.currentDeviceId, devices, message, notifications, timings),
+                                        context, keys, state.currentDeviceId, devices, message,
+                                        notifications, timings),
                                 reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
                                 () -> {
                                     long remembered = System.nanoTime();
@@ -327,6 +329,7 @@ public final class CloudSyncEngine {
                 // Left pending on the server; the next pull recognises and acknowledges them.
             }
             postNotifications(context, notifications);
+            keys.close();
         }
         timings.log(startedAt);
         // Fail the pull after the rest went through, so callers back off instead of
@@ -359,7 +362,7 @@ public final class CloudSyncEngine {
 
     /** Applies one delivery and returns its payload kind. */
     private static String applyDelivery(
-            Context context, String currentDeviceId, Map<String, Device> devices, JSONObject message,
+            Context context, CloudCrypto.Session keys, String currentDeviceId, Map<String, Device> devices, JSONObject message,
             IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
         Device source = devices.get(message.getString("sourceDeviceId"));
         if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
@@ -370,7 +373,7 @@ public final class CloudSyncEngine {
         }
         long started = System.nanoTime();
         JSONObject payload = CloudCrypto.decrypt(
-                message.getString("eventId"), currentDeviceId, source.publicKey,
+                keys, message.getString("eventId"), currentDeviceId, source.publicKey,
                 message.getJSONObject("envelope"));
         long decrypted = System.nanoTime();
         timings.decrypt += decrypted - started;
