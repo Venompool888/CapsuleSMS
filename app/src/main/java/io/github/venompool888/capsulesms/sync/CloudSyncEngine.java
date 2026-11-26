@@ -257,6 +257,12 @@ public final class CloudSyncEngine {
         boolean[] processedDirty = {false};
         List<Long> pendingAcks = new ArrayList<>();
         CloudCrypto.Session keys = new CloudCrypto.Session();
+        SmsDuplicateIndex duplicates = new SmsDuplicateIndex((address, from, to) -> {
+            List<SmsDuplicateIndex.Row> rows = new ArrayList<>();
+            SmsRepository.forEachMessage(context, address, from, to,
+                    (id, body, type, date) -> rows.add(new SmsDuplicateIndex.Row(id, body, type, date)));
+            return rows;
+        });
         IncomingNotificationBatch notifications = new IncomingNotificationBatch();
         int inserted = 0;
         RetryLaterException deferred = null;
@@ -285,7 +291,7 @@ public final class CloudSyncEngine {
                         if (completeDelivery(
                                 () -> kind[0] = applyDelivery(
                                         context, keys, state.currentDeviceId, devices, message,
-                                        notifications, timings),
+                                        notifications, duplicates, timings),
                                 reason -> config.recordError(CloudSyncConfig.PULL, "跳过同步消息 #" + deliveryId + "：" + reason),
                                 () -> {
                                     long remembered = System.nanoTime();
@@ -316,6 +322,8 @@ public final class CloudSyncEngine {
                 // still redelivers is recognised.
                 flushProcessed(context, processed, processedDirty, timings);
                 acknowledgeAll(config, pendingAcks, timings);
+                // One change notification per page instead of one per inserted SMS.
+                if (duplicates.takeAdded()) SmsRepository.notifySmsChanged(context);
                 long next = response.optLong("nextCursor", cursor);
                 if (messages.length() < PULL_PAGE_SIZE || next <= cursor) break;
                 cursor = next;
@@ -328,6 +336,7 @@ public final class CloudSyncEngine {
             } catch (Exception ignored) {
                 // Left pending on the server; the next pull recognises and acknowledges them.
             }
+            if (duplicates.takeAdded()) SmsRepository.notifySmsChanged(context);
             postNotifications(context, notifications);
             keys.close();
         }
@@ -363,7 +372,8 @@ public final class CloudSyncEngine {
     /** Applies one delivery and returns its payload kind. */
     private static String applyDelivery(
             Context context, CloudCrypto.Session keys, String currentDeviceId, Map<String, Device> devices, JSONObject message,
-            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
+            IncomingNotificationBatch notifications, SmsDuplicateIndex duplicates,
+            PullTimings timings) throws Exception {
         Device source = devices.get(message.getString("sourceDeviceId"));
         if (source == null || source.publicKey == null || source.publicKey.isBlank()) {
             throw new CloudCrypto.InvalidEnvelopeException("找不到发送设备的公钥");
@@ -377,7 +387,7 @@ public final class CloudSyncEngine {
                 message.getJSONObject("envelope"));
         long decrypted = System.nanoTime();
         timings.decrypt += decrypted - started;
-        String kind = processPayload(context, payload, source, notifications, timings);
+        String kind = processPayload(context, payload, source, notifications, duplicates, timings);
         timings.apply += System.nanoTime() - decrypted;
         return kind;
     }
@@ -473,10 +483,11 @@ public final class CloudSyncEngine {
     }
 
     private static String processPayload(Context context, JSONObject payload, Device source,
-            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
+            IncomingNotificationBatch notifications, SmsDuplicateIndex duplicates,
+            PullTimings timings) throws Exception {
         String kind = payload.optString("kind");
         if (KIND_SMS.equals(kind)) {
-            insertPayload(context, payload, source, notifications, timings);
+            insertPayload(context, payload, source, notifications, duplicates, timings);
             return kind;
         }
         if (KIND_SEND_SMS.equals(kind)) {
@@ -512,7 +523,8 @@ public final class CloudSyncEngine {
     }
 
     private static void insertPayload(Context context, JSONObject payload, Device source,
-            IncomingNotificationBatch notifications, PullTimings timings) throws Exception {
+            IncomingNotificationBatch notifications, SmsDuplicateIndex duplicates,
+            PullTimings timings) throws Exception {
         String address = payload.getString("address");
         String body = payload.getString("body");
         long timestamp = payload.getLong("timestamp");
@@ -526,7 +538,7 @@ public final class CloudSyncEngine {
             throw new InvalidPayloadException("同步短信内容无效");
         }
         long phase = System.nanoTime();
-        long existingId = SmsRepository.findMessageId(context, address, body, timestamp, type);
+        long existingId = duplicates.find(address, body, type, timestamp);
         timings.findDuplicate += System.nanoTime() - phase;
         if (existingId >= 0) {
             phase = System.nanoTime();
@@ -540,18 +552,20 @@ public final class CloudSyncEngine {
         // OPPO SIM ID to Pixel can make the target SmsProvider reject the insert.
         int targetSubscriptionId = -1;
         if (type == Telephony.Sms.MESSAGE_TYPE_SENT) {
-            saved = SmsRepository.saveSent(context, address, body, timestamp, targetSubscriptionId);
+            saved = SmsRepository.saveSent(context, address, body, timestamp, targetSubscriptionId, false);
         } else {
-            saved = SmsRepository.saveIncoming(context, address, body, timestamp, targetSubscriptionId);
+            saved = SmsRepository.saveIncoming(context, address, body, timestamp, targetSubscriptionId, false);
         }
         timings.insert += System.nanoTime() - phase;
         // Checked before notifying, so a retried delivery doesn't notify twice.
         if (saved == null) throw new RetryLaterException("无法写入系统短信库");
+        long savedId = ContentUris.parseId(saved);
+        duplicates.add(address, body, type, timestamp, savedId);
         if (type == Telephony.Sms.MESSAGE_TYPE_INBOX) {
             notifications.add(address, body, origin.displayLabel());
         }
         phase = System.nanoTime();
-        new CloudMessageOriginStore(context).put(ContentUris.parseId(saved), origin);
+        new CloudMessageOriginStore(context).put(savedId, origin);
         timings.origin += System.nanoTime() - phase;
     }
 
