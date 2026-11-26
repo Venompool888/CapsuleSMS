@@ -641,13 +641,13 @@ public final class CloudSyncEngine {
             try {
                 CloudSyncApi.post(config, "/api/v1/messages/ack",
                         new JSONObject().put("deliveryIds", new JSONArray(batch)));
-                timings.ackRequests++;
                 batch.clear();
             } catch (CloudSyncApi.ApiException error) {
                 if (error.status != 404 && error.status != 405) throw error;
                 batchAckUnsupported = true;
             } finally {
                 timings.ack += System.nanoTime() - started;
+                timings.ackRequests++;
             }
         }
     }
