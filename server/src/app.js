@@ -14,10 +14,12 @@ import {
   hashPassword,
   normalizeUsername,
   tokenHash,
+  userError,
   verifyPassword,
 } from "./security.js";
 import {
   adminPage,
+  errorPage,
   enrollmentPage,
   loginPage,
   portalPage,
@@ -54,7 +56,7 @@ export function createApp({ db, config }) {
   const limiter = loginLimiter();
   app.get("/healthz", (_req, res) => res.json({ status: "ok", service: "capsule-sms-sync" }));
   app.get("/", (req, res) => res.redirect(readWebUser(req, db) ? "/portal" : "/login"));
-  app.get("/login", (req, res) => res.send(loginPage(req.query.error)));
+  app.get("/login", (_req, res) => res.send(loginPage()));
   app.post("/login", limiter, asyncHandler(async (req, res) => {
     requireSecureRequest(req, config);
     const user = await authenticateUser(db, req.body.username, req.body.password);
@@ -76,26 +78,26 @@ export function createApp({ db, config }) {
       FROM users u LEFT JOIN devices d ON d.user_id = u.id
       GROUP BY u.id ORDER BY u.role, u.username
     `).all();
-    res.send(adminPage(req.webUser, users, req.query.message));
+    res.send(adminPage(req.webUser, users, notice(req)));
   });
   app.post("/admin/users", requireWebUser(db, "admin"), requireCsrf, asyncHandler(async (req, res) => {
     await createUser(db, { username: req.body.username, password: req.body.password });
-    res.redirect("/admin?message=" + encodeURIComponent("用户已创建"));
+    res.redirect("/admin?notice=user-created");
   }));
   app.post("/admin/users/:id/toggle", requireWebUser(db, "admin"), requireCsrf, (req, res) => {
     db.prepare(`
       UPDATE users SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END
       WHERE id = ? AND role = 'user'
     `).run(req.params.id);
-    res.redirect("/admin?message=" + encodeURIComponent("用户状态已更新"));
+    res.redirect("/admin?notice=user-toggled");
   });
   app.post("/admin/users/:id/password", requireWebUser(db, "admin"), requireCsrf, asyncHandler(async (req, res) => {
     const passwordHash = await hashPassword(req.body.password);
     const changed = db.prepare("UPDATE users SET password_hash = ? WHERE id = ? AND role = 'user'")
       .run(passwordHash, req.params.id);
-    if (!changed.changes) throw new Error("用户不存在");
+    if (!changed.changes) throw userError("用户不存在", 404);
     db.prepare("DELETE FROM sessions WHERE user_id = ?").run(req.params.id);
-    res.redirect("/admin?message=" + encodeURIComponent("密码已重置，原网页登录会话已失效"));
+    res.redirect("/admin?notice=password-reset");
   }));
 
   app.get("/portal", requireWebUser(db), (req, res) => {
@@ -107,7 +109,7 @@ export function createApp({ db, config }) {
       SELECT r.source_device_id, r.target_device_id FROM sync_routes r
       JOIN devices d ON d.id = r.source_device_id WHERE d.user_id = ?
     `).all(req.webUser.id);
-    res.send(portalPage(req.webUser, devices, routes, req.query.message));
+    res.send(portalPage(req.webUser, devices, routes, notice(req)));
   });
   app.post("/portal/enrollments", requireWebUser(db), requireCsrf, asyncHandler(async (req, res) => {
     const enrollment = createEnrollment(db, {
@@ -120,7 +122,7 @@ export function createApp({ db, config }) {
   }));
   app.post("/portal/devices/:id/revoke", requireWebUser(db), requireCsrf, (req, res) => {
     revokeDevice(db, req.params.id, req.webUser.id);
-    res.redirect("/portal?message=" + encodeURIComponent("设备已撤销"));
+    res.redirect("/portal?notice=device-revoked");
   });
   app.post("/portal/routes", requireWebUser(db), requireCsrf, (req, res) => {
     replaceRoutes(
@@ -130,7 +132,7 @@ export function createApp({ db, config }) {
       req.body.pushTo,
       req.body.receiveFrom,
     );
-    res.redirect("/portal?message=" + encodeURIComponent("同步关系已保存，并自动更新到关联设备"));
+    res.redirect("/portal?notice=routes-saved");
   });
 
   app.post("/api/v1/connect", limiter, asyncHandler(async (req, res) => {
@@ -303,10 +305,28 @@ export function createApp({ db, config }) {
     const isApi = req.path.startsWith("/api/");
     const status = error.status ?? 400;
     if (isApi) return jsonError(res, status, "request_failed", error.message || "请求失败");
-    res.status(status).send(loginPage(error.message || "请求失败"));
+    // Web pages show only messages written for people; internal errors stay in the log.
+    if (!error.expose) console.error(error);
+    const message = error.expose ? error.message : "请求没有完成，请稍后再试。";
+    const user = req.webUser ?? readWebUser(req, db);
+    if (user) return res.status(status).send(errorPage(user, message));
+    res.status(status).send(loginPage(message));
   });
 
   return app;
+}
+
+// Pages take a notice code, never free text, so a crafted link can't put its own words on them.
+const NOTICES = {
+  "user-created": "用户已创建",
+  "user-toggled": "用户状态已更新",
+  "password-reset": "密码已重置，原网页登录会话已失效",
+  "device-revoked": "设备已撤销",
+  "routes-saved": "同步关系已保存，并自动更新到关联设备",
+};
+
+function notice(req) {
+  return Object.hasOwn(NOTICES, req.query.notice) ? NOTICES[req.query.notice] : "";
 }
 
 function notifyMessageWaiters(waiters, deviceId) {
@@ -354,7 +374,7 @@ function requireWebUser(db, role = null) {
   return (req, res, next) => {
     const user = readWebUser(req, db);
     if (!user) return res.redirect("/login");
-    if (role && user.role !== role) return res.status(403).send("Forbidden");
+    if (role && user.role !== role) return res.status(403).send(errorPage(user, "这个页面只有管理员可以打开。"));
     req.webUser = user;
     next();
   };
@@ -371,7 +391,9 @@ function readWebUser(req, db) {
 }
 
 function requireCsrf(req, res, next) {
-  if (!req.webUser || req.body.csrf !== req.webUser.csrf) return res.status(403).send("CSRF validation failed");
+  if (!req.webUser || req.body?.csrf !== req.webUser.csrf) {
+    return res.status(403).send(errorPage(req.webUser, "页面已过期，请返回后刷新再试一次。"));
+  }
   next();
 }
 
@@ -411,9 +433,7 @@ function revokeDevice(db, deviceId, userId) {
 
 function requireSecureRequest(req, config) {
   if (!config.allowInsecureHttp && !req.secure) {
-    const error = new Error("账号密码和设备注册码只能通过 HTTPS 发送");
-    error.status = 426;
-    throw error;
+    throw userError("账号密码和设备注册码只能通过 HTTPS 发送", 426);
   }
 }
 

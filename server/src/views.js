@@ -19,6 +19,12 @@ export function loginPage(message = "") {
   return shell("登录", `<section class="card narrow"><h1>登录管理界面</h1><p class="muted">管理员可管理用户；普通用户可管理自己的设备和同步关系。</p>${message ? `<div class="alert">${escapeHtml(message)}</div>` : ""}<form method="post" action="/login"><label>用户名<input name="username" autocomplete="username" required></label><label>密码<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">登录</button></form></section>`);
 }
 
+export function errorPage(user, message) {
+  const back = user?.role === "admin" ? "/admin" : "/portal";
+  const body = `<section class="card narrow"><h1>没能完成</h1><div class="alert">${escapeHtml(message)}</div><a class="button secondary" href="${user ? back : "/login"}">返回</a></section>`;
+  return shell("没能完成", body, user);
+}
+
 export function adminPage(user, users, message = "") {
   const rows = users.map((entry) => `<tr><td>${escapeHtml(entry.username)}</td><td>${entry.role === "admin" ? "管理员" : "用户"}</td><td>${entry.device_count}</td><td>${entry.enabled ? "正常" : "停用"}</td><td>${entry.role === "admin" ? "—" : `<div class="actions"><form method="post" action="/admin/users/${entry.id}/toggle"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><button class="secondary">${entry.enabled ? "停用" : "启用"}</button></form><form class="password-reset" method="post" action="/admin/users/${entry.id}/password"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><input type="password" name="password" minlength="12" required placeholder="新密码"><button class="secondary">重置密码</button></form></div>`}</td></tr>`).join("");
   return shell("用户管理", `<div class="title-row"><div><h1>用户管理</h1><p class="muted">创建账号、停用账号并查看设备数量。</p></div></div>${message ? `<div class="alert success">${escapeHtml(message)}</div>` : ""}<section class="card"><h2>新增用户</h2><form class="inline-form" method="post" action="/admin/users"><input type="hidden" name="csrf" value="${escapeHtml(user.csrf)}"><label>用户名<input name="username" required placeholder="yuri"></label><label>初始密码<input type="password" name="password" minlength="12" required></label><button type="submit">创建</button></form></section><section class="card"><table><thead><tr><th>用户名</th><th>角色</th><th>设备</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table></section>`, user);

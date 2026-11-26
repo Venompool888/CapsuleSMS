@@ -292,6 +292,61 @@ test("a target that never collects stops accepting new deliveries past the cap",
   }
 });
 
+test("web pages show notices by code only, never text from the link", async () => {
+  const session = await webLogin();
+  const crafted = await session.get("/portal?message=" + encodeURIComponent("请访问 evil.example") + "&notice=nope");
+  assert.doesNotMatch(crafted, /evil\.example/);
+  assert.doesNotMatch(crafted, /alert success/);
+  assert.match(await session.get("/portal?notice=device-revoked"), /设备已撤销/);
+  const login = await (await fetch(`${baseUrl}/login?error=${encodeURIComponent("请访问 evil.example")}`)).text();
+  assert.doesNotMatch(login, /evil\.example/);
+});
+
+test("a failed web action keeps you signed in and shows what went wrong", async () => {
+  const session = await webLogin();
+  const response = await session.post("/portal/routes", { csrf: session.csrf, deviceId: "no-such-device" });
+  assert.equal(response.status, 400);
+  const page = await response.text();
+  assert.match(page, /设备不存在或已停用/);
+  assert.match(page, /退出/);
+  assert.doesNotMatch(page, /name="password"/);
+
+  const stale = await session.post("/portal/routes", { csrf: "stale", deviceId: "x" });
+  assert.equal(stale.status, 403);
+  assert.match(await stale.text(), /页面已过期/);
+
+  const forbidden = await fetch(`${baseUrl}/admin`, { headers: { cookie: session.cookie } });
+  assert.equal(forbidden.status, 403);
+  assert.match(await forbidden.text(), /只有管理员/);
+});
+
+test("a duplicate username gets a plain message instead of a database error", async () => {
+  await assert.rejects(
+    createUser(db, { username: "sync-user", password: "another-long-password" }),
+    (error) => error.expose === true && error.message === "这个用户名已被使用",
+  );
+});
+
+async function webLogin() {
+  const response = await fetch(`${baseUrl}/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: "sync-user", password: "correct-horse-battery-staple" }),
+  });
+  assert.equal(response.status, 302);
+  const cookie = response.headers.get("set-cookie").split(";")[0];
+  const get = async (path) => (await fetch(`${baseUrl}${path}`, { headers: { cookie } })).text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(await get("/portal"))[1];
+  const post = (path, form) => fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(form),
+  });
+  return { cookie, csrf, get, post };
+}
+
 async function connect(body) {
   const response = await fetch(`${baseUrl}/api/v1/connect`, {
     method: "POST",

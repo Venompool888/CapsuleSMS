@@ -48,16 +48,25 @@ export async function verifyPassword(password, encoded) {
   }
 }
 
+// An error whose message is meant for the person using the web page or app.
+// Anything else is treated as internal and shown only as a generic message.
+export function userError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  error.expose = true;
+  return error;
+}
+
 export function validatePassword(password) {
   if (typeof password !== "string" || password.length < 12 || password.length > 256) {
-    throw new Error("密码长度必须为 12–256 个字符");
+    throw userError("密码长度必须为 12–256 个字符");
   }
 }
 
 export function normalizeUsername(value) {
   const username = String(value ?? "").trim().toLowerCase();
   if (!/^[a-z0-9][a-z0-9._-]{2,31}$/.test(username)) {
-    throw new Error("用户名需为 3–32 位小写字母、数字、点、下划线或短横线");
+    throw userError("用户名需为 3–32 位小写字母、数字、点、下划线或短横线");
   }
   return username;
 }
