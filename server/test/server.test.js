@@ -243,6 +243,55 @@ test("a disconnecting device can revoke itself, which drops its token and routes
   assert.equal(after.devices.some((device) => device.id === leaving.deviceId), false);
 });
 
+test("revoking a device drops the deliveries still waiting for it", async () => {
+  const credentials = { username: "sync-user", password: "correct-horse-battery-staple" };
+  const sender = await connect({ ...credentials, deviceName: "Sender" });
+  const lost = await connect({ ...credentials, deviceName: "Lost phone" });
+  await api(sender.deviceToken, "/api/v1/sync-routes", {
+    method: "PUT", body: { pushTo: [lost.deviceId], receiveFrom: [] },
+  });
+  await api(sender.deviceToken, "/api/v1/messages", {
+    method: "POST", expectedStatus: 202,
+    body: { eventId: `${sender.deviceId}:lost-0001`,
+      envelope: { algorithm: "test-only", ciphertext: "x" } },
+  });
+  const pending = () => db.prepare(
+    "SELECT COUNT(*) AS count FROM message_deliveries WHERE target_device_id = ?",
+  ).get(lost.deviceId).count;
+  assert.equal(pending(), 1);
+  await api(lost.deviceToken, "/api/v1/devices/self/revoke", { method: "POST", body: {} });
+  assert.equal(pending(), 0);
+});
+
+test("a target that never collects stops accepting new deliveries past the cap", async () => {
+  const capped = createApp({ db, config: { ...config, maxPendingPerTarget: 2 } }).listen(0, "127.0.0.1");
+  await new Promise((resolve) => capped.once("listening", resolve));
+  const cappedBase = `http://127.0.0.1:${capped.address().port}`;
+  try {
+    const credentials = { username: "sync-user", password: "correct-horse-battery-staple" };
+    const sender = await connect({ ...credentials, deviceName: "Busy sender" });
+    const idle = await connect({ ...credentials, deviceName: "Idle receiver" });
+    await api(sender.deviceToken, "/api/v1/sync-routes", {
+      method: "PUT", body: { pushTo: [idle.deviceId], receiveFrom: [] },
+    });
+    const accepted = [];
+    for (let i = 1; i <= 3; i++) {
+      const response = await fetch(`${cappedBase}/api/v1/messages`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sender.deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ eventId: `${sender.deviceId}:cap-000${i}`,
+          envelope: { algorithm: "test-only", ciphertext: `m${i}` } }),
+      });
+      assert.equal(response.status, 202);
+      accepted.push((await response.json()).acceptedTargets);
+    }
+    assert.deepEqual(accepted, [[idle.deviceId], [idle.deviceId], []]);
+    assert.equal((await api(idle.deviceToken, "/api/v1/messages")).messages.length, 2);
+  } finally {
+    await new Promise((resolve) => capped.close(resolve));
+  }
+});
+
 async function connect(body) {
   const response = await fetch(`${baseUrl}/api/v1/connect`, {
     method: "POST",
